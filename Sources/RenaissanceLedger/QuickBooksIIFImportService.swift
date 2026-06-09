@@ -35,9 +35,18 @@ enum QuickBooksIIFImportService {
         qbType.uppercased() == "NONPOSTING"
     }
 
+    /// Strip QuickBooks' field quoting. IIF is tab-delimited, but QuickBooks still wraps any
+    /// field containing a comma (e.g. a `"Lastname, Firstname"` customer or a `"City, ST ZIP"`
+    /// address) in double quotes, CSV-style, and doubles embedded quotes. Left as-is, those
+    /// quotes become part of the imported name and break matching against existing records.
+    static func unquote(_ field: String) -> String {
+        guard field.count >= 2, field.hasPrefix("\""), field.hasSuffix("\"") else { return field }
+        return String(field.dropFirst().dropLast()).replacingOccurrences(of: "\"\"", with: "\"")
+    }
+
     /// Parse IIF text into records grouped by record type. Header lines begin with `!TYPE`
     /// and define the columns; data lines begin with `TYPE` and map positionally to the most
-    /// recent header for that type. Column keys are upper-cased.
+    /// recent header for that type. Column keys are upper-cased; values are unquoted.
     static func parse(_ text: String) -> [String: [[String: String]]] {
         var headers: [String: [String]] = [:]
         var records: [String: [[String: String]]] = [:]
@@ -49,9 +58,9 @@ enum QuickBooksIIFImportService {
             let fields = line.components(separatedBy: "\t")
             guard let first = fields.first, !first.isEmpty else { continue }
             if first.hasPrefix("!") {
-                headers[String(first.dropFirst())] = Array(fields.dropFirst())
+                headers[String(first.dropFirst())] = fields.dropFirst().map(unquote)
             } else if let cols = headers[first] {
-                let values = Array(fields.dropFirst())
+                let values = fields.dropFirst().map(unquote)
                 var record: [String: String] = [:]
                 for (i, col) in cols.enumerated() where i < values.count {
                     record[col.uppercased()] = values[i]

@@ -119,4 +119,39 @@ struct IIFImportTests {
         #expect(second.customers == 0)
         #expect(second.vendors == 0)
     }
+
+    /// QuickBooks CSV-style quotes any field containing a comma (e.g. "Lastname, Firstname"
+    /// names and "City, ST ZIP" addresses). Those quotes must be stripped, or the imported
+    /// name carries the quotes and never matches the same customer entered without them.
+    static let quotedIIF = """
+    !CUST\tNAME\tREFNUM\tTIMESTAMP\tBADDR1\tBADDR2\tPHONE1\tCOMPANYNAME
+    CUST\t"Ables, Ed"\t1\t0\t123 Main St\t"Nokesville, VA 20181"\t555-1000\tAbles Construction
+    """
+
+    @Test("QuickBooks field quotes are stripped from imported values")
+    func stripsQuotedFields() throws {
+        // The raw value keeps its quotes; unquote removes them and unescapes doubled quotes.
+        #expect(QuickBooksIIFImportService.unquote("\"Ables, Ed\"") == "Ables, Ed")
+        #expect(QuickBooksIIFImportService.unquote("\"a \"\"b\"\" c\"") == "a \"b\" c")
+        #expect(QuickBooksIIFImportService.unquote("Plain") == "Plain")
+
+        let db = try TestDB.make()
+        _ = try QuickBooksIIFImportService.importIIF(Self.quotedIIF, into: db)
+        // Imported under the clean, unquoted name — not "\"Ables, Ed\"".
+        #expect(try db.fetchCustomers().contains { $0.name == "Ables, Ed" })
+        #expect(try !db.fetchCustomers().contains { $0.name.hasPrefix("\"") })
+    }
+
+    @Test("A customer already present unquoted is not re-added from a quoted export")
+    func quotedNameDedupesAgainstUnquoted() throws {
+        let db = try TestDB.make()
+        // The customer already exists, entered normally (no quotes), as if from a prior migration.
+        _ = try db.insertCustomer(name: "Ables, Ed", company: "", primaryContact: "",
+                                  email: "", phone: "", address: "", city: "", state: "", zip: "")
+        // Importing the quoted export must recognize it as the same customer and skip it.
+        let summary = try QuickBooksIIFImportService.importIIF(Self.quotedIIF, into: db)
+        #expect(summary.customers == 0)
+        #expect(summary.skipped >= 1)
+        #expect(try db.fetchCustomers().filter { $0.name.contains("Ables") }.count == 1)
+    }
 }
