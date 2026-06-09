@@ -82,6 +82,7 @@ final class SQLiteDatabase {
         try migrateV24()
         try migrateV25()
         try migrateV26()
+        try migrateV27()
     }
 
     func migrate() throws {
@@ -5990,5 +5991,212 @@ final class SQLiteDatabase {
                 throw DBError.stepFailed(lastErrorMessage)
             }
         }
+    }
+
+    // MARK: - Double-entry posting layer (ADR-001)
+
+    /// Creates the ledger table. The ledger is *derived* from the operational tables
+    /// (see `rebuildJournal`), so it can always be regenerated and never drifts silently.
+    func migrateV27() throws {
+        try exec(
+            """
+            CREATE TABLE IF NOT EXISTS journal_lines (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                txn_kind TEXT NOT NULL,
+                txn_id INTEGER NOT NULL,
+                line_date TEXT NOT NULL DEFAULT '',
+                account_id INTEGER NOT NULL REFERENCES gl_accounts(id),
+                debit REAL NOT NULL DEFAULT 0,
+                credit REAL NOT NULL DEFAULT 0,
+                memo TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_journal_lines_txn ON journal_lines(txn_kind, txn_id);
+            CREATE INDEX IF NOT EXISTS idx_journal_lines_account ON journal_lines(account_id, line_date);
+            """
+        )
+    }
+
+    /// One side of a journal entry.
+    struct JournalPosting {
+        let accountID: Int64
+        let debit: Double
+        let credit: Double
+    }
+
+    /// Post a balanced set of journal lines for one operational transaction, replacing any
+    /// prior lines for `(kind, txnID)` so posting is idempotent. Throws if unbalanced.
+    func postJournalEntry(kind: String, txnID: Int64, date: String,
+                          lines: [JournalPosting], memo: String = "") throws {
+        let totalDebit = lines.reduce(0) { $0 + $1.debit }
+        let totalCredit = lines.reduce(0) { $0 + $1.credit }
+        guard abs(totalDebit - totalCredit) < 0.005 else {
+            throw DBError.stepFailed("Unbalanced journal entry \(kind)#\(txnID): debit \(totalDebit) != credit \(totalCredit)")
+        }
+        try withStatement("DELETE FROM journal_lines WHERE txn_kind = ? AND txn_id = ?") { stmt in
+            bindText(stmt: stmt, index: 1, value: kind)
+            sqlite3_bind_int64(stmt, 2, txnID)
+            _ = sqlite3_step(stmt)
+        }
+        for line in lines where abs(line.debit) > 0.0001 || abs(line.credit) > 0.0001 {
+            try withStatement(
+                "INSERT INTO journal_lines(txn_kind, txn_id, line_date, account_id, debit, credit, memo, created_at) VALUES (?,?,?,?,?,?,?,?)"
+            ) { stmt in
+                bindText(stmt: stmt, index: 1, value: kind)
+                sqlite3_bind_int64(stmt, 2, txnID)
+                bindText(stmt: stmt, index: 3, value: date)
+                sqlite3_bind_int64(stmt, 4, line.accountID)
+                sqlite3_bind_double(stmt, 5, line.debit)
+                sqlite3_bind_double(stmt, 6, line.credit)
+                bindText(stmt: stmt, index: 7, value: memo)
+                bindText(stmt: stmt, index: 8, value: isoNow())
+                if sqlite3_step(stmt) != SQLITE_DONE { throw DBError.stepFailed(lastErrorMessage) }
+            }
+        }
+    }
+
+    private func ledgerAccountID(named name: String) throws -> Int64 {
+        var result: Int64?
+        try withStatement("SELECT id FROM gl_accounts WHERE LOWER(name) = LOWER(?) ORDER BY id LIMIT 1") { stmt in
+            bindText(stmt: stmt, index: 1, value: name)
+            if sqlite3_step(stmt) == SQLITE_ROW { result = sqlite3_column_int64(stmt, 0) }
+        }
+        guard let id = result else { throw DBError.stepFailed("Ledger account '\(name)' not found") }
+        return id
+    }
+
+    private func defaultIncomeAccountID() throws -> Int64 {
+        var result: Int64?
+        try withStatement("SELECT id FROM gl_accounts WHERE type = 'income' ORDER BY number, id LIMIT 1") { stmt in
+            if sqlite3_step(stmt) == SQLITE_ROW { result = sqlite3_column_int64(stmt, 0) }
+        }
+        guard let id = result else { throw DBError.stepFailed("No income account is defined") }
+        return id
+    }
+
+    /// Rebuild the entire double-entry ledger from the operational tables — both the
+    /// one-time backfill and an always-available consistency tool (the ledger is derived,
+    /// so it can never drift silently). Accrual model: invoices recognize income into A/R;
+    /// bills recognize expense into A/P; payments and deposits move cash; a bill payment's
+    /// bookkeeping `expenses` row (tagged "Bill payment") is treated as an A/P settlement,
+    /// not a second expense. Returns the trial-balance totals (debits, credits).
+    @discardableResult
+    func rebuildJournal() throws -> (debits: Double, credits: Double) {
+        let ar = try ledgerAccountID(named: "Accounts Receivable")
+        let ap = try ledgerAccountID(named: "Accounts Payable")
+        let undeposited = try ledgerAccountID(named: "Undeposited Funds")
+        let income = try defaultIncomeAccountID()
+
+        struct Inv { let id: Int64; let date: String; let total: Double }
+        struct Pay { let id: Int64; let date: String; let amount: Double; let depositAccount: Int64; let hasDepositLine: Bool }
+        struct Dep { let id: Int64; let date: String; let account: Int64; let total: Double }
+        struct Exp { let id: Int64; let date: String; let amount: Double; let account: Int64; let payAccount: Int64; let isBillPayment: Bool }
+        struct Bil { let id: Int64; let date: String; let amount: Double; let account: Int64 }
+
+        var invoices: [Inv] = [], payments: [Pay] = [], deposits: [Dep] = [], expenses: [Exp] = [], bills: [Bil] = []
+
+        try withStatement("SELECT id, issue_date, total FROM native_invoices") { s in
+            while sqlite3_step(s) == SQLITE_ROW {
+                invoices.append(Inv(id: sqlite3_column_int64(s, 0), date: columnText(s, 1), total: sqlite3_column_double(s, 2)))
+            }
+        }
+        try withStatement(
+            """
+            SELECT p.id, p.payment_date, p.amount, COALESCE(p.deposit_account_id, 0),
+                   EXISTS(SELECT 1 FROM deposit_record_lines dl WHERE dl.payment_id = p.id)
+            FROM payments_received p WHERE p.amount > 0.0001
+            """
+        ) { s in
+            while sqlite3_step(s) == SQLITE_ROW {
+                payments.append(Pay(id: sqlite3_column_int64(s, 0), date: columnText(s, 1), amount: sqlite3_column_double(s, 2),
+                                    depositAccount: sqlite3_column_int64(s, 3), hasDepositLine: sqlite3_column_int64(s, 4) != 0))
+            }
+        }
+        try withStatement("SELECT id, deposit_date, account_id, total_amount FROM deposit_records") { s in
+            while sqlite3_step(s) == SQLITE_ROW {
+                deposits.append(Dep(id: sqlite3_column_int64(s, 0), date: columnText(s, 1), account: sqlite3_column_int64(s, 2), total: sqlite3_column_double(s, 3)))
+            }
+        }
+        try withStatement("SELECT id, expense_date, amount, COALESCE(account_id, 0), COALESCE(payment_account_id, 0), memo FROM expenses") { s in
+            while sqlite3_step(s) == SQLITE_ROW {
+                let memo = columnText(s, 5)
+                expenses.append(Exp(id: sqlite3_column_int64(s, 0), date: columnText(s, 1), amount: sqlite3_column_double(s, 2),
+                                    account: sqlite3_column_int64(s, 3), payAccount: sqlite3_column_int64(s, 4),
+                                    isBillPayment: memo.hasPrefix("Bill payment")))
+            }
+        }
+        try withStatement("SELECT id, bill_date, amount, COALESCE(account_id, 0) FROM bills") { s in
+            while sqlite3_step(s) == SQLITE_ROW {
+                bills.append(Bil(id: sqlite3_column_int64(s, 0), date: columnText(s, 1), amount: sqlite3_column_double(s, 2), account: sqlite3_column_int64(s, 3)))
+            }
+        }
+
+        try exec("BEGIN IMMEDIATE TRANSACTION;")
+        do {
+            try exec("DELETE FROM journal_lines;")
+            for v in invoices {
+                try postJournalEntry(kind: "invoice", txnID: v.id, date: v.date,
+                    lines: [JournalPosting(accountID: ar, debit: v.total, credit: 0),
+                            JournalPosting(accountID: income, debit: 0, credit: v.total)])
+            }
+            for p in payments {
+                let cash = (p.hasDepositLine || p.depositAccount == 0) ? undeposited : p.depositAccount
+                try postJournalEntry(kind: "payment", txnID: p.id, date: p.date,
+                    lines: [JournalPosting(accountID: cash, debit: p.amount, credit: 0),
+                            JournalPosting(accountID: ar, debit: 0, credit: p.amount)])
+            }
+            for d in deposits {
+                try postJournalEntry(kind: "deposit", txnID: d.id, date: d.date,
+                    lines: [JournalPosting(accountID: d.account, debit: d.total, credit: 0),
+                            JournalPosting(accountID: undeposited, debit: 0, credit: d.total)])
+            }
+            for e in expenses where e.payAccount != 0 && e.account != 0 {
+                let debitAccount = e.isBillPayment ? ap : e.account
+                if e.amount >= 0 {
+                    try postJournalEntry(kind: "expense", txnID: e.id, date: e.date,
+                        lines: [JournalPosting(accountID: debitAccount, debit: e.amount, credit: 0),
+                                JournalPosting(accountID: e.payAccount, debit: 0, credit: e.amount)])
+                } else {
+                    try postJournalEntry(kind: "expense", txnID: e.id, date: e.date,
+                        lines: [JournalPosting(accountID: e.payAccount, debit: -e.amount, credit: 0),
+                                JournalPosting(accountID: debitAccount, debit: 0, credit: -e.amount)])
+                }
+            }
+            for b in bills where b.account != 0 {
+                try postJournalEntry(kind: "bill", txnID: b.id, date: b.date,
+                    lines: [JournalPosting(accountID: b.account, debit: b.amount, credit: 0),
+                            JournalPosting(accountID: ap, debit: 0, credit: b.amount)])
+            }
+            try exec("COMMIT;")
+        } catch {
+            try? exec("ROLLBACK;")
+            throw error
+        }
+        return try trialBalanceTotals()
+    }
+
+    /// Total debits and credits across the whole ledger — equal in a valid double-entry set.
+    func trialBalanceTotals() throws -> (debits: Double, credits: Double) {
+        var d = 0.0, c = 0.0
+        try withStatement("SELECT IFNULL(SUM(debit), 0), IFNULL(SUM(credit), 0) FROM journal_lines") { s in
+            if sqlite3_step(s) == SQLITE_ROW { d = sqlite3_column_double(s, 0); c = sqlite3_column_double(s, 1) }
+        }
+        return (d, c)
+    }
+
+    /// Signed ledger balance of an account: debits - credits (positive for asset/expense
+    /// accounts with a normal debit balance, negative for liability/income/equity).
+    func ledgerAccountBalance(_ accountID: Int64) throws -> Double {
+        var bal = 0.0
+        try withStatement("SELECT IFNULL(SUM(debit) - SUM(credit), 0) FROM journal_lines WHERE account_id = ?") { s in
+            sqlite3_bind_int64(s, 1, accountID)
+            if sqlite3_step(s) == SQLITE_ROW { bal = sqlite3_column_double(s, 0) }
+        }
+        return bal
+    }
+
+    /// Ledger balance of a named account (convenience for reports and tests).
+    func ledgerBalance(named name: String) throws -> Double {
+        try ledgerAccountBalance(try ledgerAccountID(named: name))
     }
 }
