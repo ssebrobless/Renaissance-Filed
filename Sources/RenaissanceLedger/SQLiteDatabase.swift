@@ -6133,9 +6133,10 @@ final class SQLiteDatabase {
 
         try exec("BEGIN IMMEDIATE TRANSACTION;")
         do {
-            // Regenerate only the derived entries; preserve imported history (e.g. a
-            // QuickBooks Journal import lands as kind 'qb_import' and must survive a rebuild).
-            try exec("DELETE FROM journal_lines WHERE txn_kind <> 'qb_import';")
+            // Regenerate only the derived entries; preserve any non-derived history.
+            // Imported QuickBooks transactions ('qb_import') and onboarding opening
+            // balances ('opening') are authored once and must survive a rebuild.
+            try exec("DELETE FROM journal_lines WHERE txn_kind IN ('invoice','payment','deposit','expense','bill');")
             for v in invoices {
                 try postJournalEntry(kind: "invoice", txnID: v.id, date: v.date,
                     lines: [JournalPosting(accountID: ar, debit: v.total, credit: 0),
@@ -6181,6 +6182,14 @@ final class SQLiteDatabase {
     func deleteJournalEntries(kind: String) throws {
         try withStatement("DELETE FROM journal_lines WHERE txn_kind = ?") { stmt in
             bindText(stmt: stmt, index: 1, value: kind)
+            if sqlite3_step(stmt) != SQLITE_DONE { throw DBError.stepFailed(lastErrorMessage) }
+        }
+    }
+
+    func deleteJournalEntries(kind: String, txnID: Int64) throws {
+        try withStatement("DELETE FROM journal_lines WHERE txn_kind = ? AND txn_id = ?") { stmt in
+            bindText(stmt: stmt, index: 1, value: kind)
+            sqlite3_bind_int64(stmt, 2, txnID)
             if sqlite3_step(stmt) != SQLITE_DONE { throw DBError.stepFailed(lastErrorMessage) }
         }
     }
