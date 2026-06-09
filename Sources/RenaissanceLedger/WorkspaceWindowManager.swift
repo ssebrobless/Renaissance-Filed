@@ -209,6 +209,7 @@ final class WorkspaceWindowManager: ObservableObject {
     private var windows: [WorkspaceWindowKind: NSWindow] = [:]
     private var delegates: [WorkspaceWindowKind: WorkspaceNativeWindowDelegate] = [:]
     private var supportCompletionWindow: NSWindow?
+    private var onboardingWindow: NSWindow?
     private var suppressRestoreSnapshotSaves = false
     private var didBootstrapWindows = false
 
@@ -226,6 +227,13 @@ final class WorkspaceWindowManager: ObservableObject {
         guard let model else { return }
         guard !didBootstrapWindows else { return }
         didBootstrapWindows = true
+
+        // A brand-new install gets the first-run setup wizard instead of the workspace; the
+        // normal windows open once setup finishes (or is skipped).
+        if (try? OnboardingService.isFreshSetup(model.db)) == true {
+            showOnboardingWindow()
+            return
+        }
 
         if shouldPreferNavigatorLaunch(for: model) {
             showNavigatorWindow()
@@ -389,6 +397,45 @@ final class WorkspaceWindowManager: ObservableObject {
             windowFrames: frames
         )
         WorkspaceRestoreStore.shared.save(snapshot)
+    }
+
+    /// Present the first-run onboarding wizard. When the user finishes (or skips), the window
+    /// closes and the normal launch workspace opens.
+    func showOnboardingWindow() {
+        guard let model else { return }
+        if onboardingWindow?.isVisible == true {
+            onboardingWindow?.makeKeyAndOrderFront(nil)
+            return
+        }
+
+        let content = OnboardingWizardView(onFinish: { [weak self] in
+            self?.finishOnboarding()
+        })
+        .environmentObject(model)
+        .themedRoot()
+
+        let hostingController = NSHostingController(rootView: content)
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 560, height: 560),
+            styleMask: [.titled, .fullSizeContentView],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "Set Up Renaissance Filed"
+        window.titlebarAppearsTransparent = true
+        window.isReleasedWhenClosed = false
+        window.contentViewController = hostingController
+        window.center()
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+        onboardingWindow = window
+    }
+
+    private func finishOnboarding() {
+        onboardingWindow?.orderOut(nil)
+        onboardingWindow = nil
+        session.isReportViewerExpanded = false
+        showCenterWindow()
     }
 
     func showSupportCompletionNotice(_ notice: TechSupportCompletionNotice) {
