@@ -31,6 +31,12 @@ final class SQLiteDatabase {
         self.databaseURL = root.appendingPathComponent("ledger.sqlite")
     }
 
+    /// Test-only initializer targeting an explicit on-disk database file, so unit tests
+    /// can run against an isolated temporary database instead of the shared singleton.
+    init(databaseURL: URL) {
+        self.databaseURL = databaseURL
+    }
+
     deinit {
         if db != nil {
             sqlite3_close(db)

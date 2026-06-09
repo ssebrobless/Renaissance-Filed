@@ -31,5 +31,9 @@ let package = Package(
                 .linkedLibrary("sqlite3"),
             ]
         ),
+        .testTarget(
+            name: "RenaissanceLedgerTests",
+            dependencies: ["RenaissanceLedger"]
+        ),
     ]
 )
