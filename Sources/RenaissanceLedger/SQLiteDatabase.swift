@@ -2117,6 +2117,7 @@ final class SQLiteDatabase {
             }
 
             try exec("COMMIT;")
+            try? repostInvoice(invoiceID)   // keep the ledger current; rebuild is the backstop
             return invoiceID
         } catch {
             try? exec("ROLLBACK;")
@@ -2207,6 +2208,7 @@ final class SQLiteDatabase {
             }
 
             try exec("COMMIT;")
+            try? repostInvoice(id)   // reflect the edited totals in the ledger
         } catch {
             try? exec("ROLLBACK;")
             throw error
@@ -2712,6 +2714,7 @@ final class SQLiteDatabase {
             }
 
             try exec("COMMIT;")
+            if let paymentID { try? repostPayment(paymentID) }   // book the cash receipt live
             return paymentID
         } catch {
             try? exec("ROLLBACK;")
@@ -3009,6 +3012,10 @@ final class SQLiteDatabase {
             }
 
             try exec("COMMIT;")
+            // Book the deposit (Undeposited → bank) and re-book each payment, whose cash
+            // side now belongs in Undeposited Funds.
+            try? repostDeposit(depositID)
+            for paymentID in uniquePaymentIDs { try? repostPayment(paymentID) }
             return depositID
         } catch {
             try? exec("ROLLBACK;")
@@ -3364,7 +3371,9 @@ final class SQLiteDatabase {
                 throw DBError.stepFailed(lastErrorMessage)
             }
         }
-        return sqlite3_last_insert_rowid(db)
+        let expenseID = sqlite3_last_insert_rowid(db)
+        try? repostExpense(expenseID)
+        return expenseID
     }
 
     /// Insert a GL account and return its id. Used by reconcile harness seeding
@@ -3920,6 +3929,7 @@ final class SQLiteDatabase {
                 throw DBError.stepFailed(lastErrorMessage)
             }
         }
+        try? repostInvoice(id)   // parity with rebuildJournal, which posts regardless of status
     }
 
     // MARK: - Customer Update
@@ -3985,6 +3995,7 @@ final class SQLiteDatabase {
                 throw DBError.stepFailed(lastErrorMessage)
             }
         }
+        try? repostExpense(id)   // reflect edited amount/account in the ledger
     }
 
     func deleteExpense(id: Int64) throws {
@@ -4001,6 +4012,7 @@ final class SQLiteDatabase {
                 throw DBError.stepFailed(lastErrorMessage)
             }
         }
+        try? repostExpense(id)   // row is gone → clears its ledger lines
     }
 
     // MARK: - AR Aging Report
@@ -4796,7 +4808,9 @@ final class SQLiteDatabase {
                 throw DBError.stepFailed(lastErrorMessage)
             }
         }
-        return sqlite3_last_insert_rowid(db)
+        let billID = sqlite3_last_insert_rowid(db)
+        try? repostBill(billID)
+        return billID
     }
 
     func fetchBillPayments(billID: Int64) throws -> [BillPaymentRow] {
@@ -4843,6 +4857,7 @@ final class SQLiteDatabase {
         let normalizedMethod = paymentMethod.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Check" : paymentMethod
         let baseCheckNumber = startingCheckNumber.trimmingCharacters(in: .whitespacesAndNewlines)
         var nextCheck = Int(baseCheckNumber)
+        var createdExpenseIDs: [Int64] = []   // the bookkeeping "Bill payment" rows to post live
 
         try exec("BEGIN IMMEDIATE TRANSACTION;")
         do {
@@ -4981,9 +4996,13 @@ final class SQLiteDatabase {
                         throw DBError.stepFailed(lastErrorMessage)
                     }
                 }
+                createdExpenseIDs.append(sqlite3_last_insert_rowid(db))
             }
 
             try exec("COMMIT;")
+            // Post each bill-payment expense (it settles Accounts Payable). The bills' own
+            // entries are unchanged, so they don't need reposting.
+            for expenseID in createdExpenseIDs { try? repostExpense(expenseID) }
         } catch {
             try? exec("ROLLBACK;")
             throw error
@@ -5009,6 +5028,7 @@ final class SQLiteDatabase {
                 throw DBError.stepFailed(lastErrorMessage)
             }
         }
+        try? repostBill(id)   // row is gone → clears its ledger lines
     }
 
     // MARK: - Backup
@@ -6074,6 +6094,108 @@ final class SQLiteDatabase {
         return id
     }
 
+    // MARK: - Per-transaction ledger posting (single source of truth)
+
+    // Each `repost` reads one operational row by id and writes that transaction's balanced
+    // journal lines — or clears them when the row is gone or not postable. Both the full
+    // `rebuildJournal` and the live write paths call these, so the accrual rules live in
+    // exactly one place and the live ledger can never diverge from a rebuild.
+
+    /// Post (or clear) the ledger entry for a single invoice. Matches `rebuildJournal`: an
+    /// invoice recognizes income into A/R regardless of status, so a void leaves it in place.
+    func repostInvoice(_ id: Int64) throws {
+        var date = "", total = 0.0, found = false
+        try withStatement("SELECT issue_date, total FROM native_invoices WHERE id = ?") { s in
+            sqlite3_bind_int64(s, 1, id)
+            if sqlite3_step(s) == SQLITE_ROW { date = columnText(s, 0); total = sqlite3_column_double(s, 1); found = true }
+        }
+        guard found else { try deleteJournalEntries(kind: "invoice", txnID: id); return }
+        let ar = try ledgerAccountID(named: "Accounts Receivable")
+        let income = try defaultIncomeAccountID()
+        try postJournalEntry(kind: "invoice", txnID: id, date: date,
+            lines: [JournalPosting(accountID: ar, debit: total, credit: 0),
+                    JournalPosting(accountID: income, debit: 0, credit: total)])
+    }
+
+    /// Post (or clear) the ledger entry for a single customer payment. Cash lands in
+    /// Undeposited Funds until a deposit moves it, unless it was booked straight to a bank.
+    func repostPayment(_ id: Int64) throws {
+        var date = "", amount = 0.0, depositAccount: Int64 = 0, hasDepositLine = false, found = false
+        try withStatement(
+            """
+            SELECT p.payment_date, p.amount, COALESCE(p.deposit_account_id, 0),
+                   EXISTS(SELECT 1 FROM deposit_record_lines dl WHERE dl.payment_id = p.id)
+            FROM payments_received p WHERE p.id = ?
+            """
+        ) { s in
+            sqlite3_bind_int64(s, 1, id)
+            if sqlite3_step(s) == SQLITE_ROW {
+                date = columnText(s, 0); amount = sqlite3_column_double(s, 1)
+                depositAccount = sqlite3_column_int64(s, 2); hasDepositLine = sqlite3_column_int64(s, 3) != 0; found = true
+            }
+        }
+        guard found, amount > 0.0001 else { try deleteJournalEntries(kind: "payment", txnID: id); return }
+        let ar = try ledgerAccountID(named: "Accounts Receivable")
+        let undeposited = try ledgerAccountID(named: "Undeposited Funds")
+        let cash = (hasDepositLine || depositAccount == 0) ? undeposited : depositAccount
+        try postJournalEntry(kind: "payment", txnID: id, date: date,
+            lines: [JournalPosting(accountID: cash, debit: amount, credit: 0),
+                    JournalPosting(accountID: ar, debit: 0, credit: amount)])
+    }
+
+    /// Post (or clear) the ledger entry for a single deposit: money moves from Undeposited
+    /// Funds into the destination bank account.
+    func repostDeposit(_ id: Int64) throws {
+        var date = "", total = 0.0, account: Int64 = 0, found = false
+        try withStatement("SELECT deposit_date, account_id, total_amount FROM deposit_records WHERE id = ?") { s in
+            sqlite3_bind_int64(s, 1, id)
+            if sqlite3_step(s) == SQLITE_ROW { date = columnText(s, 0); account = sqlite3_column_int64(s, 1); total = sqlite3_column_double(s, 2); found = true }
+        }
+        guard found else { try deleteJournalEntries(kind: "deposit", txnID: id); return }
+        let undeposited = try ledgerAccountID(named: "Undeposited Funds")
+        try postJournalEntry(kind: "deposit", txnID: id, date: date,
+            lines: [JournalPosting(accountID: account, debit: total, credit: 0),
+                    JournalPosting(accountID: undeposited, debit: 0, credit: total)])
+    }
+
+    /// Post (or clear) the ledger entry for a single expense. A bookkeeping "Bill payment"
+    /// expense settles Accounts Payable instead of recognizing a second expense.
+    func repostExpense(_ id: Int64) throws {
+        var date = "", memo = "", amount = 0.0, account: Int64 = 0, payAccount: Int64 = 0, found = false
+        try withStatement("SELECT expense_date, amount, COALESCE(account_id, 0), COALESCE(payment_account_id, 0), memo FROM expenses WHERE id = ?") { s in
+            sqlite3_bind_int64(s, 1, id)
+            if sqlite3_step(s) == SQLITE_ROW {
+                date = columnText(s, 0); amount = sqlite3_column_double(s, 1)
+                account = sqlite3_column_int64(s, 2); payAccount = sqlite3_column_int64(s, 3); memo = columnText(s, 4); found = true
+            }
+        }
+        guard found, payAccount != 0, account != 0 else { try deleteJournalEntries(kind: "expense", txnID: id); return }
+        let debitAccount = memo.hasPrefix("Bill payment") ? try ledgerAccountID(named: "Accounts Payable") : account
+        if amount >= 0 {
+            try postJournalEntry(kind: "expense", txnID: id, date: date,
+                lines: [JournalPosting(accountID: debitAccount, debit: amount, credit: 0),
+                        JournalPosting(accountID: payAccount, debit: 0, credit: amount)])
+        } else {
+            try postJournalEntry(kind: "expense", txnID: id, date: date,
+                lines: [JournalPosting(accountID: payAccount, debit: -amount, credit: 0),
+                        JournalPosting(accountID: debitAccount, debit: 0, credit: -amount)])
+        }
+    }
+
+    /// Post (or clear) the ledger entry for a single bill: recognizes expense into Accounts Payable.
+    func repostBill(_ id: Int64) throws {
+        var date = "", amount = 0.0, account: Int64 = 0, found = false
+        try withStatement("SELECT bill_date, amount, COALESCE(account_id, 0) FROM bills WHERE id = ?") { s in
+            sqlite3_bind_int64(s, 1, id)
+            if sqlite3_step(s) == SQLITE_ROW { date = columnText(s, 0); amount = sqlite3_column_double(s, 1); account = sqlite3_column_int64(s, 2); found = true }
+        }
+        guard found, account != 0 else { try deleteJournalEntries(kind: "bill", txnID: id); return }
+        let ap = try ledgerAccountID(named: "Accounts Payable")
+        try postJournalEntry(kind: "bill", txnID: id, date: date,
+            lines: [JournalPosting(accountID: account, debit: amount, credit: 0),
+                    JournalPosting(accountID: ap, debit: 0, credit: amount)])
+    }
+
     /// Rebuild the entire double-entry ledger from the operational tables — both the
     /// one-time backfill and an always-available consistency tool (the ledger is derived,
     /// so it can never drift silently). Accrual model: invoices recognize income into A/R;
@@ -6082,53 +6204,23 @@ final class SQLiteDatabase {
     /// not a second expense. Returns the trial-balance totals (debits, credits).
     @discardableResult
     func rebuildJournal() throws -> (debits: Double, credits: Double) {
-        let ar = try ledgerAccountID(named: "Accounts Receivable")
-        let ap = try ledgerAccountID(named: "Accounts Payable")
-        let undeposited = try ledgerAccountID(named: "Undeposited Funds")
-        let income = try defaultIncomeAccountID()
-
-        struct Inv { let id: Int64; let date: String; let total: Double }
-        struct Pay { let id: Int64; let date: String; let amount: Double; let depositAccount: Int64; let hasDepositLine: Bool }
-        struct Dep { let id: Int64; let date: String; let account: Int64; let total: Double }
-        struct Exp { let id: Int64; let date: String; let amount: Double; let account: Int64; let payAccount: Int64; let isBillPayment: Bool }
-        struct Bil { let id: Int64; let date: String; let amount: Double; let account: Int64 }
-
-        var invoices: [Inv] = [], payments: [Pay] = [], deposits: [Dep] = [], expenses: [Exp] = [], bills: [Bil] = []
-
-        try withStatement("SELECT id, issue_date, total FROM native_invoices") { s in
-            while sqlite3_step(s) == SQLITE_ROW {
-                invoices.append(Inv(id: sqlite3_column_int64(s, 0), date: columnText(s, 1), total: sqlite3_column_double(s, 2)))
-            }
+        // Collect every operational row id, then repost each through the same single-entry
+        // helpers the live write paths use — so a rebuild and live posting are identical.
+        var invoiceIDs: [Int64] = [], paymentIDs: [Int64] = [], depositIDs: [Int64] = [], expenseIDs: [Int64] = [], billIDs: [Int64] = []
+        try withStatement("SELECT id FROM native_invoices") { s in
+            while sqlite3_step(s) == SQLITE_ROW { invoiceIDs.append(sqlite3_column_int64(s, 0)) }
         }
-        try withStatement(
-            """
-            SELECT p.id, p.payment_date, p.amount, COALESCE(p.deposit_account_id, 0),
-                   EXISTS(SELECT 1 FROM deposit_record_lines dl WHERE dl.payment_id = p.id)
-            FROM payments_received p WHERE p.amount > 0.0001
-            """
-        ) { s in
-            while sqlite3_step(s) == SQLITE_ROW {
-                payments.append(Pay(id: sqlite3_column_int64(s, 0), date: columnText(s, 1), amount: sqlite3_column_double(s, 2),
-                                    depositAccount: sqlite3_column_int64(s, 3), hasDepositLine: sqlite3_column_int64(s, 4) != 0))
-            }
+        try withStatement("SELECT id FROM payments_received WHERE amount > 0.0001") { s in
+            while sqlite3_step(s) == SQLITE_ROW { paymentIDs.append(sqlite3_column_int64(s, 0)) }
         }
-        try withStatement("SELECT id, deposit_date, account_id, total_amount FROM deposit_records") { s in
-            while sqlite3_step(s) == SQLITE_ROW {
-                deposits.append(Dep(id: sqlite3_column_int64(s, 0), date: columnText(s, 1), account: sqlite3_column_int64(s, 2), total: sqlite3_column_double(s, 3)))
-            }
+        try withStatement("SELECT id FROM deposit_records") { s in
+            while sqlite3_step(s) == SQLITE_ROW { depositIDs.append(sqlite3_column_int64(s, 0)) }
         }
-        try withStatement("SELECT id, expense_date, amount, COALESCE(account_id, 0), COALESCE(payment_account_id, 0), memo FROM expenses") { s in
-            while sqlite3_step(s) == SQLITE_ROW {
-                let memo = columnText(s, 5)
-                expenses.append(Exp(id: sqlite3_column_int64(s, 0), date: columnText(s, 1), amount: sqlite3_column_double(s, 2),
-                                    account: sqlite3_column_int64(s, 3), payAccount: sqlite3_column_int64(s, 4),
-                                    isBillPayment: memo.hasPrefix("Bill payment")))
-            }
+        try withStatement("SELECT id FROM expenses") { s in
+            while sqlite3_step(s) == SQLITE_ROW { expenseIDs.append(sqlite3_column_int64(s, 0)) }
         }
-        try withStatement("SELECT id, bill_date, amount, COALESCE(account_id, 0) FROM bills") { s in
-            while sqlite3_step(s) == SQLITE_ROW {
-                bills.append(Bil(id: sqlite3_column_int64(s, 0), date: columnText(s, 1), amount: sqlite3_column_double(s, 2), account: sqlite3_column_int64(s, 3)))
-            }
+        try withStatement("SELECT id FROM bills") { s in
+            while sqlite3_step(s) == SQLITE_ROW { billIDs.append(sqlite3_column_int64(s, 0)) }
         }
 
         try exec("BEGIN IMMEDIATE TRANSACTION;")
@@ -6137,39 +6229,11 @@ final class SQLiteDatabase {
             // Imported QuickBooks transactions ('qb_import') and onboarding opening
             // balances ('opening') are authored once and must survive a rebuild.
             try exec("DELETE FROM journal_lines WHERE txn_kind IN ('invoice','payment','deposit','expense','bill');")
-            for v in invoices {
-                try postJournalEntry(kind: "invoice", txnID: v.id, date: v.date,
-                    lines: [JournalPosting(accountID: ar, debit: v.total, credit: 0),
-                            JournalPosting(accountID: income, debit: 0, credit: v.total)])
-            }
-            for p in payments {
-                let cash = (p.hasDepositLine || p.depositAccount == 0) ? undeposited : p.depositAccount
-                try postJournalEntry(kind: "payment", txnID: p.id, date: p.date,
-                    lines: [JournalPosting(accountID: cash, debit: p.amount, credit: 0),
-                            JournalPosting(accountID: ar, debit: 0, credit: p.amount)])
-            }
-            for d in deposits {
-                try postJournalEntry(kind: "deposit", txnID: d.id, date: d.date,
-                    lines: [JournalPosting(accountID: d.account, debit: d.total, credit: 0),
-                            JournalPosting(accountID: undeposited, debit: 0, credit: d.total)])
-            }
-            for e in expenses where e.payAccount != 0 && e.account != 0 {
-                let debitAccount = e.isBillPayment ? ap : e.account
-                if e.amount >= 0 {
-                    try postJournalEntry(kind: "expense", txnID: e.id, date: e.date,
-                        lines: [JournalPosting(accountID: debitAccount, debit: e.amount, credit: 0),
-                                JournalPosting(accountID: e.payAccount, debit: 0, credit: e.amount)])
-                } else {
-                    try postJournalEntry(kind: "expense", txnID: e.id, date: e.date,
-                        lines: [JournalPosting(accountID: e.payAccount, debit: -e.amount, credit: 0),
-                                JournalPosting(accountID: debitAccount, debit: 0, credit: -e.amount)])
-                }
-            }
-            for b in bills where b.account != 0 {
-                try postJournalEntry(kind: "bill", txnID: b.id, date: b.date,
-                    lines: [JournalPosting(accountID: b.account, debit: b.amount, credit: 0),
-                            JournalPosting(accountID: ap, debit: 0, credit: b.amount)])
-            }
+            for id in invoiceIDs { try repostInvoice(id) }
+            for id in paymentIDs { try repostPayment(id) }
+            for id in depositIDs { try repostDeposit(id) }
+            for id in expenseIDs { try repostExpense(id) }
+            for id in billIDs { try repostBill(id) }
             try exec("COMMIT;")
         } catch {
             try? exec("ROLLBACK;")
