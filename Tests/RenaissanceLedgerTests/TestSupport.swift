@@ -32,4 +32,18 @@ enum TestDB {
         try db.insertCustomer(name: name, company: "", primaryContact: "", email: "",
                               phone: "", address: "", city: "", state: "", zip: "")
     }
+
+    /// The first seeded expense account (to categorize bills/expenses against).
+    static func expenseAccountID(_ db: SQLiteDatabase) throws -> Int64 {
+        guard let acct = try db.fetchAccounts(type: "expense").first else { throw TestError.noAccount }
+        return acct.id
+    }
+
+    /// The display name of an account by id.
+    static func accountName(_ db: SQLiteDatabase, id: Int64) throws -> String {
+        for type in ["asset", "liability", "expense", "income", "equity"] {
+            if let a = try db.fetchAccounts(type: type).first(where: { $0.id == id }) { return a.name }
+        }
+        throw TestError.noAccount
+    }
 }
