@@ -73,6 +73,9 @@ struct SettingsView: View {
             Text("Settings & Backup")
                 .font(.title2.bold())
 
+            QuickBooksImportSection()
+                .environmentObject(model)
+
             GroupBox {
                 VStack(alignment: .leading, spacing: 14) {
                     HStack {
