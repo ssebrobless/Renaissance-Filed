@@ -83,6 +83,7 @@ final class SQLiteDatabase {
         try migrateV25()
         try migrateV26()
         try migrateV27()
+        try migrateV28()
     }
 
     func migrate() throws {
@@ -2279,6 +2280,9 @@ final class SQLiteDatabase {
             let receiptID = sqlite3_last_insert_rowid(db)
             try insertSalesReceiptLines(receiptID: receiptID, lines: lines)
             try exec("COMMIT;")
+            // Posted after commit so repostPayment sees the sales_receipts row and books the
+            // cash as income (not a receivable).
+            try? repostPayment(paymentID)
             return receiptID
         } catch {
             try? exec("ROLLBACK;")
@@ -2386,6 +2390,7 @@ final class SQLiteDatabase {
             try insertSalesReceiptLines(receiptID: id, lines: lines)
 
             try exec("COMMIT;")
+            try? repostPayment(paymentID)   // re-book the cash sale's income at the new total
         } catch {
             try? exec("ROLLBACK;")
             throw error
@@ -4934,6 +4939,7 @@ final class SQLiteDatabase {
                         throw DBError.stepFailed(lastErrorMessage)
                     }
                 }
+                let billPaymentID = sqlite3_last_insert_rowid(db)
 
                 try withStatement(
                     "UPDATE bills SET status='paid', paid_date=?, check_number=? WHERE id=?"
@@ -4961,9 +4967,10 @@ final class SQLiteDatabase {
                         check_number,
                         memo,
                         job_id,
-                        created_at
+                        created_at,
+                        bill_payment_id
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """
                 ) { stmt in
                     if let vendorID {
@@ -4992,6 +4999,7 @@ final class SQLiteDatabase {
                         sqlite3_bind_null(stmt, 9)
                     }
                     bindText(stmt: stmt, index: 10, value: isoNow())
+                    sqlite3_bind_int64(stmt, 11, billPaymentID)
                     if sqlite3_step(stmt) != SQLITE_DONE {
                         throw DBError.stepFailed(lastErrorMessage)
                     }
@@ -6037,6 +6045,13 @@ final class SQLiteDatabase {
         )
     }
 
+    /// Link a bookkeeping bill-payment expense to the bill_payment it settles, so the ledger
+    /// recognizes it as an Accounts Payable settlement via a real foreign key rather than by
+    /// parsing the memo text. (Legacy rows without the link still fall back to the memo prefix.)
+    func migrateV28() throws {
+        sqlite3_exec(db, "ALTER TABLE expenses ADD COLUMN bill_payment_id INTEGER REFERENCES bill_payments(id)", nil, nil, nil)
+    }
+
     /// One side of a journal entry.
     struct JournalPosting {
         let accountID: Int64
@@ -6120,27 +6135,31 @@ final class SQLiteDatabase {
     /// Post (or clear) the ledger entry for a single customer payment. Cash lands in
     /// Undeposited Funds until a deposit moves it, unless it was booked straight to a bank.
     func repostPayment(_ id: Int64) throws {
-        var date = "", amount = 0.0, depositAccount: Int64 = 0, hasDepositLine = false, found = false
+        var date = "", amount = 0.0, depositAccount: Int64 = 0, hasDepositLine = false, isSalesReceipt = false, found = false
         try withStatement(
             """
             SELECT p.payment_date, p.amount, COALESCE(p.deposit_account_id, 0),
-                   EXISTS(SELECT 1 FROM deposit_record_lines dl WHERE dl.payment_id = p.id)
+                   EXISTS(SELECT 1 FROM deposit_record_lines dl WHERE dl.payment_id = p.id),
+                   EXISTS(SELECT 1 FROM sales_receipts sr WHERE sr.payment_id = p.id)
             FROM payments_received p WHERE p.id = ?
             """
         ) { s in
             sqlite3_bind_int64(s, 1, id)
             if sqlite3_step(s) == SQLITE_ROW {
                 date = columnText(s, 0); amount = sqlite3_column_double(s, 1)
-                depositAccount = sqlite3_column_int64(s, 2); hasDepositLine = sqlite3_column_int64(s, 3) != 0; found = true
+                depositAccount = sqlite3_column_int64(s, 2); hasDepositLine = sqlite3_column_int64(s, 3) != 0
+                isSalesReceipt = sqlite3_column_int64(s, 4) != 0; found = true
             }
         }
         guard found, amount > 0.0001 else { try deleteJournalEntries(kind: "payment", txnID: id); return }
-        let ar = try ledgerAccountID(named: "Accounts Receivable")
         let undeposited = try ledgerAccountID(named: "Undeposited Funds")
         let cash = (hasDepositLine || depositAccount == 0) ? undeposited : depositAccount
+        // A sales receipt is a cash sale with no invoice behind it, so its cash is earned
+        // income directly. An invoice payment instead clears the receivable it pays down.
+        let creditAccount = isSalesReceipt ? try defaultIncomeAccountID() : try ledgerAccountID(named: "Accounts Receivable")
         try postJournalEntry(kind: "payment", txnID: id, date: date,
             lines: [JournalPosting(accountID: cash, debit: amount, credit: 0),
-                    JournalPosting(accountID: ar, debit: 0, credit: amount)])
+                    JournalPosting(accountID: creditAccount, debit: 0, credit: amount)])
     }
 
     /// Post (or clear) the ledger entry for a single deposit: money moves from Undeposited
@@ -6162,15 +6181,20 @@ final class SQLiteDatabase {
     /// expense settles Accounts Payable instead of recognizing a second expense.
     func repostExpense(_ id: Int64) throws {
         var date = "", memo = "", amount = 0.0, account: Int64 = 0, payAccount: Int64 = 0, found = false
-        try withStatement("SELECT expense_date, amount, COALESCE(account_id, 0), COALESCE(payment_account_id, 0), memo FROM expenses WHERE id = ?") { s in
+        var isBillPayment = false
+        try withStatement("SELECT expense_date, amount, COALESCE(account_id, 0), COALESCE(payment_account_id, 0), memo, bill_payment_id FROM expenses WHERE id = ?") { s in
             sqlite3_bind_int64(s, 1, id)
             if sqlite3_step(s) == SQLITE_ROW {
                 date = columnText(s, 0); amount = sqlite3_column_double(s, 1)
-                account = sqlite3_column_int64(s, 2); payAccount = sqlite3_column_int64(s, 3); memo = columnText(s, 4); found = true
+                account = sqlite3_column_int64(s, 2); payAccount = sqlite3_column_int64(s, 3); memo = columnText(s, 4)
+                // A real link marks a bill-payment settlement; the memo prefix is a fallback
+                // for rows created before the link column existed.
+                isBillPayment = sqlite3_column_type(s, 5) != SQLITE_NULL || memo.hasPrefix("Bill payment")
+                found = true
             }
         }
         guard found, payAccount != 0, account != 0 else { try deleteJournalEntries(kind: "expense", txnID: id); return }
-        let debitAccount = memo.hasPrefix("Bill payment") ? try ledgerAccountID(named: "Accounts Payable") : account
+        let debitAccount = isBillPayment ? try ledgerAccountID(named: "Accounts Payable") : account
         if amount >= 0 {
             try postJournalEntry(kind: "expense", txnID: id, date: date,
                 lines: [JournalPosting(accountID: debitAccount, debit: amount, credit: 0),
