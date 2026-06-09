@@ -6133,7 +6133,9 @@ final class SQLiteDatabase {
 
         try exec("BEGIN IMMEDIATE TRANSACTION;")
         do {
-            try exec("DELETE FROM journal_lines;")
+            // Regenerate only the derived entries; preserve imported history (e.g. a
+            // QuickBooks Journal import lands as kind 'qb_import' and must survive a rebuild).
+            try exec("DELETE FROM journal_lines WHERE txn_kind <> 'qb_import';")
             for v in invoices {
                 try postJournalEntry(kind: "invoice", txnID: v.id, date: v.date,
                     lines: [JournalPosting(accountID: ar, debit: v.total, credit: 0),
@@ -6173,6 +6175,14 @@ final class SQLiteDatabase {
             throw error
         }
         return try trialBalanceTotals()
+    }
+
+    /// Delete all ledger lines of a given kind (e.g. clear a prior 'qb_import' before re-importing).
+    func deleteJournalEntries(kind: String) throws {
+        try withStatement("DELETE FROM journal_lines WHERE txn_kind = ?") { stmt in
+            bindText(stmt: stmt, index: 1, value: kind)
+            if sqlite3_step(stmt) != SQLITE_DONE { throw DBError.stepFailed(lastErrorMessage) }
+        }
     }
 
     /// Total debits and credits across the whole ledger — equal in a valid double-entry set.
