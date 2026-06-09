@@ -611,6 +611,12 @@ private extension StartupWorkspaceView {
                 workspace.openReport(.historicalPL, requestedHistoricalYear: year)
             }
             .environmentObject(model)
+        case .ledgerPL:
+            LedgerPLReportView()
+                .environmentObject(model)
+        case .balanceSheet:
+            BalanceSheetReportView()
+                .environmentObject(model)
         case .arAging:
             ARAgingReportView()
                 .environmentObject(model)

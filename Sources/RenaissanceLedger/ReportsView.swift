@@ -4,12 +4,14 @@ import SwiftUI
 enum ReportSourceKind {
     case historicalQB
     case liveOperational
+    case ledger
     case hybridReview
 
     var title: String {
         switch self {
         case .historicalQB: return "Historical QB"
         case .liveOperational: return "Live Operational"
+        case .ledger: return "Ledger (Double-Entry)"
         case .hybridReview: return "Hybrid / Review"
         }
     }
@@ -18,6 +20,7 @@ enum ReportSourceKind {
         switch self {
         case .historicalQB: return "QB"
         case .liveOperational: return "Live"
+        case .ledger: return "Ledger"
         case .hybridReview: return "Hybrid"
         }
     }
@@ -26,6 +29,7 @@ enum ReportSourceKind {
         switch self {
         case .historicalQB: return AppTheme.accent
         case .liveOperational: return AppTheme.ok
+        case .ledger: return AppTheme.accent2
         case .hybridReview: return AppTheme.warn
         }
     }
@@ -37,6 +41,8 @@ enum ReportTab: String, CaseIterable, Codable, Identifiable {
     case historicalCashFlows = "Historical QB Cash Flows"
     case salesByItem = "Sales By Item"
     case operationalPL = "Operational Cash Summary"
+    case ledgerPL = "Profit & Loss (Ledger)"
+    case balanceSheet = "Balance Sheet"
     case arAging = "A/R Aging"
     case apAging = "A/P Aging"
     case jobProfitability = "Job Profitability"
@@ -52,6 +58,8 @@ enum ReportTab: String, CaseIterable, Codable, Identifiable {
             return .historicalQB
         case .operationalPL, .arAging, .apAging, .jobProfitability, .vendorHistory, .statement, .reconciliation:
             return .liveOperational
+        case .ledgerPL, .balanceSheet:
+            return .ledger
         case .report1099:
             return .hybridReview
         }
@@ -69,6 +77,10 @@ enum ReportTab: String, CaseIterable, Codable, Identifiable {
             return "Historical QuickBooks sales by item summary"
         case .operationalPL:
             return "Day-to-day cash-style view only; use Historical QB P&L for QuickBooks-matching historical numbers"
+        case .ledgerPL:
+            return "Accrual profit & loss computed from the double-entry ledger"
+        case .balanceSheet:
+            return "Assets, liabilities, and equity from the double-entry ledger — balances by construction"
         case .arAging:
             return "Open receivables by aging bucket"
         case .apAging:
@@ -93,6 +105,8 @@ enum ReportTab: String, CaseIterable, Codable, Identifiable {
         case .historicalCashFlows: return "chart.line.text.clipboard"
         case .salesByItem: return "shippingbox"
         case .operationalPL: return "chart.bar.xaxis"
+        case .ledgerPL: return "chart.line.uptrend.xyaxis"
+        case .balanceSheet: return "scalemass"
         case .arAging: return "clock.arrow.circlepath"
         case .apAging: return "creditcard.trianglebadge.exclamationmark"
         case .jobProfitability: return "briefcase"
@@ -154,6 +168,12 @@ struct ReportsView: View {
                         activeTab = .historicalPL
                     }
                         .environmentObject(model)
+                case .ledgerPL:
+                    LedgerPLReportView()
+                        .environmentObject(model)
+                case .balanceSheet:
+                    BalanceSheetReportView()
+                        .environmentObject(model)
                 case .arAging:
                     ARAgingReportView()
                         .environmentObject(model)
@@ -209,6 +229,10 @@ struct ReportsView: View {
             return .salesByItem
         case "operational", "operationalpl", "operational_cash_pl", "operational_cash_summary":
             return .operationalPL
+        case "ledgerpl", "ledger_pl", "ledger_profit_loss", "profit_loss_ledger", "profitloss", "ledgerprofitloss":
+            return .ledgerPL
+        case "balancesheet", "balance_sheet", "balance":
+            return .balanceSheet
         case "araging", "ar_aging":
             return .arAging
         case "apaging", "ap_aging", "payables":
@@ -473,6 +497,273 @@ struct PLReportView: View {
             model.statusMessage = "Report error: \(error.localizedDescription)"
         }
         isLoading = false
+    }
+}
+
+// MARK: - Ledger P&L (double-entry)
+
+/// Accrual Profit & Loss computed from the double-entry posting layer (`journal_lines`),
+/// not the cash-style operational summary. Rebuilds the derived ledger on each run so it
+/// reflects current operational data, while preserving imported/opening history.
+struct LedgerPLReportView: View {
+    @EnvironmentObject private var model: AppViewModel
+    @State private var selectedPeriod = "this_year"
+    @State private var customFrom = Date()
+    @State private var customTo = Date()
+    @State private var report: ProfitLossReport?
+    @State private var isLoading = false
+    @State private var errorMessage = ""
+
+    private let periods = [
+        ("this_year", "This Year"),
+        ("last_year", "Last Year"),
+        ("this_quarter", "This Quarter"),
+        ("all_time", "All Time"),
+        ("custom", "Custom Range"),
+    ]
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 12) {
+                Picker("Period", selection: $selectedPeriod) {
+                    ForEach(periods, id: \.0) { p in Text(p.1).tag(p.0) }
+                }
+                .frame(width: 160)
+                if selectedPeriod == "custom" {
+                    HStack(spacing: 4) {
+                        Text("From").foregroundStyle(AppTheme.ink3)
+                        SmartDateField(date: $customFrom)
+                    }
+                    HStack(spacing: 4) {
+                        Text("To").foregroundStyle(AppTheme.ink3)
+                        SmartDateField(date: $customTo)
+                    }
+                }
+                Button("Run Report") { generateReport() }
+                    .buttonStyle(.renaissancePrimary)
+                    .disabled(isLoading)
+            }
+            .padding()
+
+            Divider()
+
+            if !errorMessage.isEmpty {
+                emptyState(icon: "exclamationmark.triangle", message: errorMessage)
+            } else if let report {
+                reportBody(report)
+            } else {
+                emptyState(icon: "chart.line.uptrend.xyaxis", message: "Select a period and click Run Report.")
+            }
+        }
+        .onAppear {
+            if report == nil && !isLoading { generateReport() }
+        }
+    }
+
+    private func reportBody(_ r: ProfitLossReport) -> some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 24) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Profit & Loss").font(.title.bold())
+                    Text(model.companyInfo.name).font(.headline).foregroundStyle(AppTheme.ink3)
+                    Text("\(r.start) through \(r.end)").font(.subheadline).foregroundStyle(AppTheme.ink3)
+                    Text("Accrual profit & loss computed from the double-entry ledger: income is earned when invoiced and expenses when incurred, regardless of when cash moves.")
+                        .font(.caption)
+                        .foregroundStyle(AppTheme.ink3)
+                }
+                .padding(.bottom, 8)
+
+                LedgerStatementSection(title: "INCOME", lines: r.income,
+                                       total: r.totalIncome, totalLabel: "Total Income", color: AppTheme.ok)
+                LedgerStatementSection(title: "EXPENSES", lines: r.expenses,
+                                       total: r.totalExpenses, totalLabel: "Total Expenses", color: AppTheme.bad)
+
+                Divider()
+                HStack {
+                    Text("NET INCOME").font(.title3.bold())
+                    Spacer()
+                    Text(rptCurrency(r.netIncome))
+                        .font(.title3.bold())
+                        .foregroundStyle(r.netIncome >= 0 ? AppTheme.ok : AppTheme.bad)
+                }
+                .padding(.vertical, 8)
+                .padding(.horizontal, 16)
+                .background(RoundedRectangle(cornerRadius: 8).fill(AppTheme.surface))
+            }
+            .padding(24)
+            .frame(maxWidth: 700)
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private func generateReport() {
+        isLoading = true
+        errorMessage = ""
+        let range = ledgerPeriodRange(selectedPeriod, customFrom: customFrom, customTo: customTo)
+        do {
+            _ = try model.db.rebuildJournal()
+            report = try model.db.computeProfitLoss(start: range.from, end: range.to)
+        } catch {
+            errorMessage = "Couldn't build the ledger P&L: \(error.localizedDescription)"
+        }
+        isLoading = false
+    }
+}
+
+// MARK: - Balance Sheet (double-entry)
+
+/// Balance Sheet computed from the double-entry ledger. Assets = Liabilities + Equity holds by
+/// construction (equity includes Retained Earnings = cumulative net income), so a green
+/// "Balanced" badge is the norm; a red one would signal a posting bug worth investigating.
+struct BalanceSheetReportView: View {
+    @EnvironmentObject private var model: AppViewModel
+    @State private var asOfDate = Date()
+    @State private var report: BalanceSheetReport?
+    @State private var isLoading = false
+    @State private var errorMessage = ""
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 12) {
+                Text("As of:").foregroundStyle(AppTheme.ink3)
+                SmartDateField(date: $asOfDate)
+                Button("Run Report") { generateReport() }
+                    .buttonStyle(.renaissancePrimary)
+                    .disabled(isLoading)
+            }
+            .padding()
+
+            Divider()
+
+            if !errorMessage.isEmpty {
+                emptyState(icon: "exclamationmark.triangle", message: errorMessage)
+            } else if let report {
+                reportBody(report)
+            } else {
+                emptyState(icon: "scalemass", message: "Pick a date and click Run Report.")
+            }
+        }
+        .onAppear {
+            if report == nil && !isLoading { generateReport() }
+        }
+    }
+
+    private func reportBody(_ r: BalanceSheetReport) -> some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 24) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Balance Sheet").font(.title.bold())
+                    Text(model.companyInfo.name).font(.headline).foregroundStyle(AppTheme.ink3)
+                    Text("As of \(r.asOf)").font(.subheadline).foregroundStyle(AppTheme.ink3)
+                    Text("Computed from the double-entry ledger. Equity includes Retained Earnings (cumulative net income to date).")
+                        .font(.caption)
+                        .foregroundStyle(AppTheme.ink3)
+                }
+                .padding(.bottom, 8)
+
+                LedgerStatementSection(title: "ASSETS", lines: r.assets,
+                                       total: r.totalAssets, totalLabel: "Total Assets", color: AppTheme.ok)
+                LedgerStatementSection(title: "LIABILITIES", lines: r.liabilities,
+                                       total: r.totalLiabilities, totalLabel: "Total Liabilities", color: AppTheme.bad)
+                LedgerStatementSection(title: "EQUITY", lines: r.equity,
+                                       total: r.totalEquity, totalLabel: "Total Equity", color: AppTheme.accent2)
+
+                Divider()
+                HStack(spacing: 10) {
+                    Text("LIABILITIES + EQUITY").font(.title3.bold())
+                    Label(r.isBalanced ? "Balanced" : "Out of balance",
+                          systemImage: r.isBalanced ? "checkmark.seal.fill" : "exclamationmark.triangle.fill")
+                        .font(.caption.bold())
+                        .foregroundStyle(r.isBalanced ? AppTheme.ok : AppTheme.bad)
+                    Spacer()
+                    Text(rptCurrency(r.totalLiabilities + r.totalEquity))
+                        .font(.title3.bold())
+                        .foregroundStyle(r.isBalanced ? AppTheme.ok : AppTheme.bad)
+                }
+                .padding(.vertical, 8)
+                .padding(.horizontal, 16)
+                .background(RoundedRectangle(cornerRadius: 8).fill(AppTheme.surface))
+            }
+            .padding(24)
+            .frame(maxWidth: 700)
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private func generateReport() {
+        isLoading = true
+        errorMessage = ""
+        let asOf = DateFormatter.isoDate.string(from: asOfDate)
+        do {
+            _ = try model.db.rebuildJournal()
+            report = try model.db.computeBalanceSheet(asOf: asOf)
+        } catch {
+            errorMessage = "Couldn't build the balance sheet: \(error.localizedDescription)"
+        }
+        isLoading = false
+    }
+}
+
+/// One titled section (account lines + total) for a ledger-derived statement.
+private struct LedgerStatementSection: View {
+    let title: String
+    let lines: [ReportAccountLine]
+    let total: Double
+    let totalLabel: String
+    let color: Color
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text(title).font(.caption.bold()).foregroundStyle(AppTheme.ink3).padding(.bottom, 6)
+            if lines.isEmpty {
+                Text("No activity in this category.").foregroundStyle(AppTheme.ink3).font(.subheadline).padding(.vertical, 4)
+            } else {
+                ForEach(lines) { line in
+                    HStack {
+                        Text(line.name).frame(maxWidth: .infinity, alignment: .leading)
+                        Text(rptCurrency(line.amount)).font(.system(.body, design: .monospaced))
+                    }
+                    .padding(.vertical, 3)
+                    .padding(.horizontal, 8)
+                    Divider()
+                }
+            }
+            HStack {
+                Text(totalLabel).font(.subheadline.bold()).frame(maxWidth: .infinity, alignment: .leading)
+                Text(rptCurrency(total)).font(.subheadline.bold()).foregroundStyle(color)
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+            .background(AppTheme.surface)
+            .cornerRadius(6)
+        }
+    }
+}
+
+/// Resolve a named period (or a custom range) to ISO `from`/`to` dates.
+private func ledgerPeriodRange(_ selectedPeriod: String, customFrom: Date, customTo: Date) -> (from: String, to: String) {
+    let cal = Calendar.current
+    let now = Date()
+    let fmt = DateFormatter.isoDate
+    switch selectedPeriod {
+    case "this_year":
+        let y = cal.component(.year, from: now)
+        return ("\(y)-01-01", "\(y)-12-31")
+    case "last_year":
+        let y = cal.component(.year, from: now) - 1
+        return ("\(y)-01-01", "\(y)-12-31")
+    case "this_quarter":
+        let month = cal.component(.month, from: now)
+        let year = cal.component(.year, from: now)
+        let qStart = ((month - 1) / 3) * 3 + 1
+        let qEnd = min(qStart + 2, 12)
+        let lastDay = cal.range(of: .day, in: .month, for: cal.date(from: DateComponents(year: year, month: qEnd))!)!.count
+        return (String(format: "%04d-%02d-01", year, qStart),
+                String(format: "%04d-%02d-%02d", year, qEnd, lastDay))
+    case "custom":
+        return (fmt.string(from: customFrom), fmt.string(from: customTo))
+    default:
+        return ("2000-01-01", "2099-12-31")
     }
 }
 
