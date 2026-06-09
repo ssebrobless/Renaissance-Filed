@@ -1,0 +1,18 @@
+# Build output
+.build/
+DerivedData/
+dist/
+*.app/
+*.icns
+
+# macOS / editor cruft
+*.DS_Store
+*.swp
+
+# --- Your books stay on your machine. Never commit financial data. ---
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.qbb
+*.iif
+*.csv
