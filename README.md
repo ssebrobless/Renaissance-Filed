@@ -101,16 +101,19 @@ correct to the penny. It's how the financial core was certified. End users never
 
 ## Roadmap
 
-The path from "proven on one business" to "anyone can use it":
+The path from "proven on one business" to "anyone can use it" — full detail, including the
+decision to add a real **double-entry posting layer**, is in **[docs/ROADMAP.md](docs/ROADMAP.md)**.
 
-1. **Generalized QuickBooks import** (standard IIF/CSV) + a "your imported balance matches
-   your last QuickBooks statement ✓" reconciliation check.
-2. **Self-computed P&L and Balance Sheet**, so a from-scratch user gets real year-end
-   statements.
-3. **Create-company / first-run onboarding.**
-4. **A unit-test suite.**
+In recommended order:
 
-Contributions toward any of these are welcome.
+1. **A unit-test suite** (the safety net — first).
+2. **Double-entry posting layer + self-computed P&L and Balance Sheet**, so a from-scratch
+   user gets real, always-balancing year-end statements.
+3. **Generalized QuickBooks import** (IIF lists + Journal-report CSV) + a "your imported
+   balance matches your last QuickBooks statement ✓" reconciliation check.
+4. **Create-company / first-run onboarding.**
+
+Contributions toward any of these are welcome — see the [issues tracker](../../issues).
 
 ## License
 
