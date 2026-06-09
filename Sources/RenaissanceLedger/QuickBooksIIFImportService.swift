@@ -23,10 +23,16 @@ enum QuickBooksIIFImportService {
         case "BANK", "AR", "OCASSET", "FIXASSET", "OASSET": return "asset"
         case "AP", "CCARD", "OCLIAB", "LTLIAB": return "liability"
         case "EQUITY": return "equity"
-        case "INC", "OINC": return "income"
+        case "INC", "OINC", "EXINC": return "income"
         case "EXP", "COGS", "OEXP", "EXEXP": return "expense"
         default: return "asset"
         }
+    }
+
+    /// QuickBooks non-posting account types (Estimates, Purchase/Sales Orders) carry no real
+    /// balance and don't belong in a double-entry chart, so they're skipped on import.
+    static func isNonPosting(_ qbType: String) -> Bool {
+        qbType.uppercased() == "NONPOSTING"
     }
 
     /// Parse IIF text into records grouped by record type. Header lines begin with `!TYPE`
@@ -75,6 +81,7 @@ enum QuickBooksIIFImportService {
         for r in records["ACCNT"] ?? [] {
             let name = value(r, ["NAME"])
             guard !name.isEmpty else { summary.skipped += 1; continue }
+            if isNonPosting(value(r, ["ACCNTTYPE"])) { summary.skipped += 1; continue }
             if existingAccounts.contains(name.lowercased()) { summary.skipped += 1; continue }
             _ = try db.insertGLAccount(name: name,
                                        type: mappedAccountType(value(r, ["ACCNTTYPE"])),

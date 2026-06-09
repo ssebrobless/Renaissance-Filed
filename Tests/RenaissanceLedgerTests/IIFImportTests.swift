@@ -60,6 +60,63 @@ struct IIFImportTests {
         #expect(QuickBooksIIFImportService.mappedAccountType("EQUITY") == "equity")
         #expect(QuickBooksIIFImportService.mappedAccountType("inc") == "income")
         #expect(QuickBooksIIFImportService.mappedAccountType("COGS") == "expense")
+        #expect(QuickBooksIIFImportService.mappedAccountType("EXEXP") == "expense")   // Other Expense
+        #expect(QuickBooksIIFImportService.mappedAccountType("EXINC") == "income")    // Other Income
         #expect(QuickBooksIIFImportService.mappedAccountType("SOMETHING_NEW") == "asset")
+    }
+
+    /// A realistic export modeled on a full QuickBooks "Lists to IIF" file (synthetic data,
+    /// real structure): the `!HDR` metadata row, the wide real `!ACCNT` column layout with
+    /// ACCNTTYPE/ACCNUM far from the front, non-posting accounts, an "Other Expense" (EXEXP)
+    /// account, and the grouped `!INVITEM` / `!ENDGRP` blocks that must not derail parsing.
+    static let realisticIIF = """
+    !HDR\tPROD\tVER\tREL\tIIFVER\tDATE\tTIME
+    HDR\tQuickBooks\tVersion 24.0\tR5\t1\t03/09/2026\t21:47
+    !ACCNT\tNAME\tREFNUM\tTIMESTAMP\tACCNTTYPE\tOBAMOUNT\tDESC\tACCNUM\tSCD\tEXTRA
+    ACCNT\tSample Operating\t1\t0\tBANK\t0\tOperating account\t1000\t\t
+    ACCNT\tSample Fuel\t2\t0\tEXEXP\t0\tOther vehicle expense\t6500\t\t
+    ACCNT\tSample Materials\t3\t0\tCOGS\t0\t\t5000\t\t
+    ACCNT\tEstimates\t4\t0\tNONPOSTING\t0\t\t0\t\t
+    ACCNT\tPurchase Orders\t5\t0\tNONPOSTING\t0\t\t0\t\t
+    !INVITEM\tNAME\tREFNUM\tTIMESTAMP\tINVITEMTYPE\tDESC\tPURCHASEDESC\tACCNT
+    INVITEM\tSome Service\t10\t0\tSERV\twork\t\tSample Operating
+    !INVITEM\tNAME\tREFNUM\tTIMESTAMP\tINVITEMTYPE\tDESC\tTOPRINT\tEXTRA\tQNTY
+    !ENDGRP
+    !CUST\tNAME\tREFNUM\tTIMESTAMP\tBADDR1\tPHONE1\tEMAIL\tCONT1\tCOMPANYNAME
+    CUST\tSample Customer\t20\t0\t123 Main\t555-1000\tcust@example.com\tPat\tSample Co
+    !VEND\tNAME\tREFNUM\tTIMESTAMP\tPRINTAS\tADDR1\tPHONE1\tEMAIL\tTAXID\tCOMPANYNAME\t1099
+    VEND\tSample Vendor\t30\t0\tSample Vendor\t1 Vendor Rd\t555-2000\tvend@example.com\t12-3456789\tSample Vendor LLC\tY
+    """
+
+    @Test("A realistic full-format export imports cleanly, skipping non-posting accounts")
+    func realisticExportImports() throws {
+        let db = try TestDB.make()
+        let summary = try QuickBooksIIFImportService.importIIF(Self.realisticIIF, into: db)
+
+        // Three real accounts import; the two NONPOSTING accounts are skipped.
+        #expect(summary.accounts == 3)
+        #expect(summary.skipped >= 2)
+        let accounts = try db.fetchAccounts()
+        #expect(!accounts.contains { $0.name == "Estimates" })
+        #expect(!accounts.contains { $0.name == "Purchase Orders" })
+
+        // Columns are read by header name despite the wide real layout.
+        #expect(accounts.contains { $0.name == "Sample Operating" && $0.type == "asset" && $0.number == "1000" })
+        #expect(accounts.contains { $0.name == "Sample Fuel" && $0.type == "expense" })   // EXEXP → expense
+
+        // The HDR / INVITEM / ENDGRP noise doesn't derail customers and vendors.
+        #expect(try db.fetchCustomers().contains { $0.name == "Sample Customer" })
+        let vendor = try #require(try db.fetchVendors().first { $0.name == "Sample Vendor" })
+        #expect(vendor.is1099)
+    }
+
+    @Test("Re-importing a realistic export skips everything (idempotent on real-shaped data)")
+    func realisticReimportIsIdempotent() throws {
+        let db = try TestDB.make()
+        _ = try QuickBooksIIFImportService.importIIF(Self.realisticIIF, into: db)
+        let second = try QuickBooksIIFImportService.importIIF(Self.realisticIIF, into: db)
+        #expect(second.accounts == 0)
+        #expect(second.customers == 0)
+        #expect(second.vendors == 0)
     }
 }
