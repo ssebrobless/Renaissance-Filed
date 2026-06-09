@@ -2631,6 +2631,7 @@ final class SQLiteDatabase {
         }
 
         let invoiceIDs = Set(normalizedCashAllocations.map(\.invoiceID) + normalizedCreditApplications.map(\.invoiceID))
+        var createdCreditApplicationIDs: [Int64] = []   // applied credits to post live
         try exec("BEGIN;")
         do {
             var paymentID: Int64?
@@ -2712,6 +2713,7 @@ final class SQLiteDatabase {
                         throw DBError.stepFailed(lastErrorMessage)
                     }
                 }
+                createdCreditApplicationIDs.append(sqlite3_last_insert_rowid(db))
             }
 
             for invoiceID in invoiceIDs {
@@ -2720,6 +2722,8 @@ final class SQLiteDatabase {
 
             try exec("COMMIT;")
             if let paymentID { try? repostPayment(paymentID) }   // book the cash receipt live
+            // Each applied credit is a revenue reversal that clears part of the receivable.
+            for creditID in createdCreditApplicationIDs { try? repostCreditApplication(creditID) }
             return paymentID
         } catch {
             try? exec("ROLLBACK;")
@@ -6220,6 +6224,24 @@ final class SQLiteDatabase {
                     JournalPosting(accountID: ap, debit: 0, credit: amount)])
     }
 
+    /// Post (or clear) the ledger entry for a single applied customer credit. A credit memo
+    /// applied to an invoice is a revenue reversal: it reduces the receivable and backs out
+    /// the income, like a return or allowance. (The unapplied remainder of a credit isn't
+    /// posted — it only affects the books once applied, mirroring the operational model.)
+    func repostCreditApplication(_ id: Int64) throws {
+        var date = "", amount = 0.0, found = false
+        try withStatement("SELECT applied_date, amount FROM credit_applications WHERE id = ?") { s in
+            sqlite3_bind_int64(s, 1, id)
+            if sqlite3_step(s) == SQLITE_ROW { date = columnText(s, 0); amount = sqlite3_column_double(s, 1); found = true }
+        }
+        guard found, amount > 0.0001 else { try deleteJournalEntries(kind: "credit", txnID: id); return }
+        let ar = try ledgerAccountID(named: "Accounts Receivable")
+        let income = try defaultIncomeAccountID()
+        try postJournalEntry(kind: "credit", txnID: id, date: date,
+            lines: [JournalPosting(accountID: income, debit: amount, credit: 0),
+                    JournalPosting(accountID: ar, debit: 0, credit: amount)])
+    }
+
     /// Rebuild the entire double-entry ledger from the operational tables — both the
     /// one-time backfill and an always-available consistency tool (the ledger is derived,
     /// so it can never drift silently). Accrual model: invoices recognize income into A/R;
@@ -6230,7 +6252,7 @@ final class SQLiteDatabase {
     func rebuildJournal() throws -> (debits: Double, credits: Double) {
         // Collect every operational row id, then repost each through the same single-entry
         // helpers the live write paths use — so a rebuild and live posting are identical.
-        var invoiceIDs: [Int64] = [], paymentIDs: [Int64] = [], depositIDs: [Int64] = [], expenseIDs: [Int64] = [], billIDs: [Int64] = []
+        var invoiceIDs: [Int64] = [], paymentIDs: [Int64] = [], depositIDs: [Int64] = [], expenseIDs: [Int64] = [], billIDs: [Int64] = [], creditIDs: [Int64] = []
         try withStatement("SELECT id FROM native_invoices") { s in
             while sqlite3_step(s) == SQLITE_ROW { invoiceIDs.append(sqlite3_column_int64(s, 0)) }
         }
@@ -6246,18 +6268,22 @@ final class SQLiteDatabase {
         try withStatement("SELECT id FROM bills") { s in
             while sqlite3_step(s) == SQLITE_ROW { billIDs.append(sqlite3_column_int64(s, 0)) }
         }
+        try withStatement("SELECT id FROM credit_applications") { s in
+            while sqlite3_step(s) == SQLITE_ROW { creditIDs.append(sqlite3_column_int64(s, 0)) }
+        }
 
         try exec("BEGIN IMMEDIATE TRANSACTION;")
         do {
             // Regenerate only the derived entries; preserve any non-derived history.
             // Imported QuickBooks transactions ('qb_import') and onboarding opening
             // balances ('opening') are authored once and must survive a rebuild.
-            try exec("DELETE FROM journal_lines WHERE txn_kind IN ('invoice','payment','deposit','expense','bill');")
+            try exec("DELETE FROM journal_lines WHERE txn_kind IN ('invoice','payment','deposit','expense','bill','credit');")
             for id in invoiceIDs { try repostInvoice(id) }
             for id in paymentIDs { try repostPayment(id) }
             for id in depositIDs { try repostDeposit(id) }
             for id in expenseIDs { try repostExpense(id) }
             for id in billIDs { try repostBill(id) }
+            for id in creditIDs { try repostCreditApplication(id) }
             try exec("COMMIT;")
         } catch {
             try? exec("ROLLBACK;")
