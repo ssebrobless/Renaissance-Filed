@@ -6199,4 +6199,102 @@ final class SQLiteDatabase {
     func ledgerBalance(named name: String) throws -> Double {
         try ledgerAccountBalance(try ledgerAccountID(named: name))
     }
+
+    // MARK: - Computed financial statements (derived from the ledger)
+    // NOTE: these read the ledger as-is. Call `rebuildJournal()` first (or once the app
+    // posts inline, the ledger is always current) so the statements reflect the books.
+
+    /// Grouped account totals for a statement section. `creditNormal` flips the sign so
+    /// income/liability/equity come out positive; date range is `[from, to]` (from=nil → through `to`).
+    private func reportAccountLines(types: [String], creditNormal: Bool,
+                                    from: String?, to: String) throws -> [ReportAccountLine] {
+        let typeList = types.map { "'\($0)'" }.joined(separator: ", ")   // literals, not user input
+        let amountExpr = creditNormal ? "SUM(j.credit - j.debit)" : "SUM(j.debit - j.credit)"
+        let dateClause = (from == nil) ? "j.line_date <= ?" : "j.line_date >= ? AND j.line_date <= ?"
+        let sql = """
+            SELECT a.id, a.name, IFNULL(\(amountExpr), 0) AS amount
+            FROM gl_accounts a JOIN journal_lines j ON j.account_id = a.id
+            WHERE a.type IN (\(typeList)) AND \(dateClause)
+            GROUP BY a.id, a.name
+            HAVING ABS(IFNULL(\(amountExpr), 0)) > 0.005
+            ORDER BY a.number, a.id
+            """
+        var lines: [ReportAccountLine] = []
+        try withStatement(sql) { s in
+            var idx: Int32 = 1
+            if let from { bindText(stmt: s, index: idx, value: from); idx += 1 }
+            bindText(stmt: s, index: idx, value: to)
+            while sqlite3_step(s) == SQLITE_ROW {
+                lines.append(ReportAccountLine(accountID: sqlite3_column_int64(s, 0),
+                                               name: columnText(s, 1),
+                                               amount: sqlite3_column_double(s, 2)))
+            }
+        }
+        return lines
+    }
+
+    /// Profit & Loss over `[start, end]`, derived from the ledger. Income and expenses are
+    /// reported as positive amounts; `netIncome = totalIncome − totalExpenses`.
+    func computeProfitLoss(start: String, end: String) throws -> ProfitLossReport {
+        ProfitLossReport(
+            start: start, end: end,
+            income: try reportAccountLines(types: ["income"], creditNormal: true, from: start, to: end),
+            expenses: try reportAccountLines(types: ["expense"], creditNormal: false, from: start, to: end))
+    }
+
+    /// Balance Sheet as of `asOf`, derived from the ledger. It balances *by construction*:
+    /// total assets = total liabilities + total equity, where equity includes Retained
+    /// Earnings = cumulative net income (income − expenses) through `asOf`.
+    func computeBalanceSheet(asOf: String) throws -> BalanceSheetReport {
+        let assets = try reportAccountLines(types: ["asset"], creditNormal: false, from: nil, to: asOf)
+        let liabilities = try reportAccountLines(types: ["liability"], creditNormal: true, from: nil, to: asOf)
+        var equity = try reportAccountLines(types: ["equity"], creditNormal: true, from: nil, to: asOf)
+
+        var retained = 0.0
+        try withStatement(
+            """
+            SELECT IFNULL(SUM(j.credit - j.debit), 0)
+            FROM journal_lines j JOIN gl_accounts a ON a.id = j.account_id
+            WHERE a.type IN ('income', 'expense') AND j.line_date <= ?
+            """
+        ) { s in
+            bindText(stmt: s, index: 1, value: asOf)
+            if sqlite3_step(s) == SQLITE_ROW { retained = sqlite3_column_double(s, 0) }
+        }
+        if abs(retained) > 0.005 {
+            equity.append(ReportAccountLine(accountID: 0, name: "Retained Earnings", amount: retained))
+        }
+        return BalanceSheetReport(asOf: asOf, assets: assets, liabilities: liabilities, equity: equity)
+    }
+}
+
+// MARK: - Financial-statement value types
+
+struct ReportAccountLine: Identifiable, Hashable {
+    let accountID: Int64
+    let name: String
+    let amount: Double
+    var id: Int64 { accountID }
+}
+
+struct ProfitLossReport {
+    let start: String
+    let end: String
+    let income: [ReportAccountLine]
+    let expenses: [ReportAccountLine]
+    var totalIncome: Double { income.reduce(0) { $0 + $1.amount } }
+    var totalExpenses: Double { expenses.reduce(0) { $0 + $1.amount } }
+    var netIncome: Double { totalIncome - totalExpenses }
+}
+
+struct BalanceSheetReport {
+    let asOf: String
+    let assets: [ReportAccountLine]
+    let liabilities: [ReportAccountLine]
+    let equity: [ReportAccountLine]   // includes a synthetic "Retained Earnings" line
+    var totalAssets: Double { assets.reduce(0) { $0 + $1.amount } }
+    var totalLiabilities: Double { liabilities.reduce(0) { $0 + $1.amount } }
+    var totalEquity: Double { equity.reduce(0) { $0 + $1.amount } }
+    /// True when assets = liabilities + equity (always, for a correctly posted ledger).
+    var isBalanced: Bool { abs(totalAssets - (totalLiabilities + totalEquity)) < 0.005 }
 }
