@@ -84,6 +84,7 @@ final class SQLiteDatabase {
         try migrateV26()
         try migrateV27()
         try migrateV28()
+        try migrateV29()
     }
 
     func migrate() throws {
@@ -6056,6 +6057,45 @@ final class SQLiteDatabase {
         sqlite3_exec(db, "ALTER TABLE expenses ADD COLUMN bill_payment_id INTEGER REFERENCES bill_payments(id)", nil, nil, nil)
     }
 
+    /// A small key/value table for ledger configuration — currently the migration cutover date
+    /// (see ADR-002): the boundary before which operational activity is captured by an opening
+    /// balance rather than posted transaction-by-transaction.
+    func migrateV29() throws {
+        try exec("CREATE TABLE IF NOT EXISTS ledger_config (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL DEFAULT '');")
+    }
+
+    /// The migration cutover date (ISO `YYYY-MM-DD`), or nil if the books post all history
+    /// directly. Operational transactions dated on or before it are not posted to the ledger.
+    func ledgerCutoverDate() throws -> String? {
+        var value: String?
+        try withStatement("SELECT value FROM ledger_config WHERE key = 'cutover_date'") { s in
+            if sqlite3_step(s) == SQLITE_ROW {
+                let v = columnText(s, 0)
+                value = v.isEmpty ? nil : v
+            }
+        }
+        return value
+    }
+
+    /// Set (or clear, with nil) the migration cutover date.
+    func setLedgerCutoverDate(_ date: String?) throws {
+        if let date, !date.isEmpty {
+            try withStatement("INSERT INTO ledger_config(key, value) VALUES ('cutover_date', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value") { s in
+                bindText(stmt: s, index: 1, value: date)
+                if sqlite3_step(s) != SQLITE_DONE { throw DBError.stepFailed(lastErrorMessage) }
+            }
+        } else {
+            try exec("DELETE FROM ledger_config WHERE key = 'cutover_date';")
+        }
+    }
+
+    /// True when a transaction dated `date` falls on or before the cutover and so must not be
+    /// posted (its position is captured by the opening-balance entry instead).
+    private func isPreCutover(_ date: String) throws -> Bool {
+        guard let cutover = try ledgerCutoverDate(), !date.isEmpty else { return false }
+        return date <= cutover
+    }
+
     /// One side of a journal entry.
     struct JournalPosting {
         let accountID: Int64
@@ -6129,6 +6169,7 @@ final class SQLiteDatabase {
             if sqlite3_step(s) == SQLITE_ROW { date = columnText(s, 0); total = sqlite3_column_double(s, 1); found = true }
         }
         guard found else { try deleteJournalEntries(kind: "invoice", txnID: id); return }
+        if try isPreCutover(date) { try deleteJournalEntries(kind: "invoice", txnID: id); return }
         let ar = try ledgerAccountID(named: "Accounts Receivable")
         let income = try defaultIncomeAccountID()
         try postJournalEntry(kind: "invoice", txnID: id, date: date,
@@ -6156,6 +6197,7 @@ final class SQLiteDatabase {
             }
         }
         guard found, amount > 0.0001 else { try deleteJournalEntries(kind: "payment", txnID: id); return }
+        if try isPreCutover(date) { try deleteJournalEntries(kind: "payment", txnID: id); return }
         let undeposited = try ledgerAccountID(named: "Undeposited Funds")
         let cash = (hasDepositLine || depositAccount == 0) ? undeposited : depositAccount
         // A sales receipt is a cash sale with no invoice behind it, so its cash is earned
@@ -6175,6 +6217,7 @@ final class SQLiteDatabase {
             if sqlite3_step(s) == SQLITE_ROW { date = columnText(s, 0); account = sqlite3_column_int64(s, 1); total = sqlite3_column_double(s, 2); found = true }
         }
         guard found else { try deleteJournalEntries(kind: "deposit", txnID: id); return }
+        if try isPreCutover(date) { try deleteJournalEntries(kind: "deposit", txnID: id); return }
         let undeposited = try ledgerAccountID(named: "Undeposited Funds")
         try postJournalEntry(kind: "deposit", txnID: id, date: date,
             lines: [JournalPosting(accountID: account, debit: total, credit: 0),
@@ -6198,6 +6241,7 @@ final class SQLiteDatabase {
             }
         }
         guard found, payAccount != 0, account != 0 else { try deleteJournalEntries(kind: "expense", txnID: id); return }
+        if try isPreCutover(date) { try deleteJournalEntries(kind: "expense", txnID: id); return }
         let debitAccount = isBillPayment ? try ledgerAccountID(named: "Accounts Payable") : account
         if amount >= 0 {
             try postJournalEntry(kind: "expense", txnID: id, date: date,
@@ -6218,6 +6262,7 @@ final class SQLiteDatabase {
             if sqlite3_step(s) == SQLITE_ROW { date = columnText(s, 0); amount = sqlite3_column_double(s, 1); account = sqlite3_column_int64(s, 2); found = true }
         }
         guard found, account != 0 else { try deleteJournalEntries(kind: "bill", txnID: id); return }
+        if try isPreCutover(date) { try deleteJournalEntries(kind: "bill", txnID: id); return }
         let ap = try ledgerAccountID(named: "Accounts Payable")
         try postJournalEntry(kind: "bill", txnID: id, date: date,
             lines: [JournalPosting(accountID: account, debit: amount, credit: 0),
@@ -6235,6 +6280,7 @@ final class SQLiteDatabase {
             if sqlite3_step(s) == SQLITE_ROW { date = columnText(s, 0); amount = sqlite3_column_double(s, 1); found = true }
         }
         guard found, amount > 0.0001 else { try deleteJournalEntries(kind: "credit", txnID: id); return }
+        if try isPreCutover(date) { try deleteJournalEntries(kind: "credit", txnID: id); return }
         let ar = try ledgerAccountID(named: "Accounts Receivable")
         let income = try defaultIncomeAccountID()
         try postJournalEntry(kind: "credit", txnID: id, date: date,

@@ -54,6 +54,42 @@ worth it for software that handles people's money.
 
 ---
 
+## Architectural decision: mid-year opening-balance migration (ADR-002)
+
+**Decision:** migrate a business onto Renaissance Filed **as of a cutover date** by recording
+opening balances, rather than requiring a faithful transaction-by-transaction history.
+
+**Context:** the posting layer (ADR-001) rebuilds the ledger from operational records. That is
+correct for data *entered in the app*, but a real QuickBooks migration carries historical
+records whose per-transaction payment dates and links are imperfect — invoices marked paid
+with no payment record, deposits without traceable receipts, opening bank and fixed-asset
+balances that never existed as transactions. Rebuilding a ledger from that data overstates
+receivables, produces negative undeposited funds, and never matches the source Balance Sheet;
+faithful point-in-time reconstruction is not recoverable from it. (Confirmed on a real
+year-long book: reconstructed A/R came out ~4× the QuickBooks figure.)
+
+**Decision detail:**
+- Store a **cutover date**. Operational transactions dated on or before it are **not posted**
+  by the ledger (their net is captured in the opening entry); transactions after it post
+  normally. Forward payments against pre-cutover open invoices/bills still draw down the
+  opening balances.
+- Record one balanced **opening journal entry** (kind `opening`, preserved across rebuilds)
+  that sets each balance-sheet account to its true value at cutover — from a trusted source
+  (the last reconciled statement, or the QuickBooks Balance Sheet) — with **Opening Balance
+  Equity** as the balancing plug.
+
+**Why:**
+- It is the standard mid-year-conversion practice every accounting package uses: you don't
+  re-enter years of history, you start from a known-good position.
+- The Balance Sheet ties out from the cutover forward and stays correct by construction.
+- It cleanly separates "history we trust as a snapshot" from "activity the app tracks itself."
+
+**Rejected alternative:** reconstruct historical statements transaction-by-transaction from the
+migrated records. Impossible in practice (the dates/links aren't faithful) and redundant (the
+source QuickBooks reports already are the historical record).
+
+---
+
 ## The work, in recommended order
 
 ### 1. Unit test suite — *do this first* · ~1 week
@@ -87,6 +123,13 @@ Replace the bespoke `RenaissanceTransfer` pipeline with standard inputs:
 A first-run wizard (shown when the database is empty): company info, a chart-of-accounts
 template (general / contractor / freelancer), optional opening balances, and a fork:
 **"Start fresh"** vs **"Import from QuickBooks"** (→ item 3).
+
+### 5. Mid-year opening-balance migration · ~1–1.5 days
+Implements ADR-002. A stored **cutover date** plus a balanced **opening-balance entry** so the
+computed statements are correct from the cutover forward on real migrated books (where rebuilding
+from imperfect history does not tie out). Extends the onboarding opening-balance step; the backfill
+writes only the derived ledger + one config row — backup-first and reversible (clear the cutover
+and delete the opening entry to revert).
 
 ---
 
