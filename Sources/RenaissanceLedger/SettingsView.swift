@@ -76,6 +76,9 @@ struct SettingsView: View {
             QuickBooksImportSection()
                 .environmentObject(model)
 
+            CutoverMigrationSection()
+                .environmentObject(model)
+
             GroupBox {
                 VStack(alignment: .leading, spacing: 14) {
                     HStack {
