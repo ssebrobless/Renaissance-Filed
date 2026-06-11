@@ -65,10 +65,10 @@ struct QuickBooksImportSection: View {
     private var stepTwoTransactions: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("2. Import transactions (Journal CSV)").font(.subheadline.weight(.semibold))
-            Text("In QuickBooks: Reports ▸ Accountant & Taxes ▸ Journal, set the date range, then export to CSV. Import lists first so accounts match by name. Re-importing replaces the prior import rather than duplicating it.")
+            Text("In QuickBooks: Reports ▸ Accountant & Taxes ▸ Journal, set the date range, then export to CSV. QuickBooks caps each export, so a long history comes out as several files (e.g. one per year) — select them all at once and they import together. Import lists first so accounts match by name. Re-importing the full set replaces the prior import rather than duplicating it.")
                 .font(.caption).foregroundStyle(AppTheme.ink3)
             HStack {
-                Button("Choose Journal CSV…") { importTransactions() }
+                Button("Choose Journal CSV File(s)…") { importTransactions() }
                     .buttonStyle(.renaissancePrimary)
                 if !journalResult.isEmpty {
                     Label(journalResult, systemImage: journalIsError ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
@@ -128,17 +128,20 @@ struct QuickBooksImportSection: View {
     }
 
     private func importTransactions() {
-        guard let url = chooseFile(
-            message: "Select a QuickBooks Journal report exported to CSV.",
-            extensions: ["csv"]) else { return }
-        guard let text = readText(url) else {
-            journalIsError = true; journalResult = "Couldn't read that file."; return
+        let urls = chooseFiles(
+            message: "Select your QuickBooks Journal report CSV file(s). For a long history exported in chunks, select them all together.",
+            extensions: ["csv"])
+        guard !urls.isEmpty else { return }
+        let texts = urls.compactMap { readText($0) }
+        guard texts.count == urls.count else {
+            journalIsError = true; journalResult = "Couldn't read one or more of those files."; return
         }
         do {
-            let s = try QuickBooksJournalImportService.importJournalCSV(text, into: model.db)
+            let s = try QuickBooksJournalImportService.importJournalCSVFiles(texts, into: model.db)
             model.refreshAccounts()
             journalIsError = false
-            journalResult = "Imported \(s.transactions) transactions (\(s.lines) lines)"
+            let fileNote = urls.count > 1 ? " from \(urls.count) files" : ""
+            journalResult = "Imported \(s.transactions) transactions (\(s.lines) lines)\(fileNote)"
                 + (s.accountsCreated > 0 ? ", created \(s.accountsCreated) new accounts" : "")
                 + (s.balancingPlug > 0.005 ? String(format: ", $%.2f routed to Opening Balance Equity", s.balancingPlug) : "")
                 + "."
@@ -170,16 +173,20 @@ struct QuickBooksImportSection: View {
     // MARK: - Helpers
 
     private func chooseFile(message: String, extensions: [String]) -> URL? {
+        chooseFiles(message: message, extensions: extensions, allowsMultiple: false).first
+    }
+
+    private func chooseFiles(message: String, extensions: [String], allowsMultiple: Bool = true) -> [URL] {
         let panel = NSOpenPanel()
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
-        panel.allowsMultipleSelection = false
+        panel.allowsMultipleSelection = allowsMultiple
         panel.prompt = "Import"
         panel.message = message
         panel.allowsOtherFileTypes = true
         panel.allowedContentTypes = extensions.compactMap { UTType(filenameExtension: $0) } + [.plainText, .commaSeparatedText, .text, .data]
-        guard panel.runModal() == .OK, let url = panel.url else { return nil }
-        return url
+        guard panel.runModal() == .OK else { return [] }
+        return panel.urls
     }
 
     private func readText(_ url: URL) -> String? {

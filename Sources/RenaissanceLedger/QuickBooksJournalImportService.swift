@@ -65,7 +65,18 @@ enum QuickBooksJournalImportService {
 
     @discardableResult
     static func importJournalCSV(_ text: String, into db: SQLiteDatabase) throws -> Summary {
-        let records = CSVParser.parse(trimmedToHeader(text))
+        try importJournalCSVFiles([text], into: db)
+    }
+
+    private struct Group { var date: String; var name: String; var lines: [SQLiteDatabase.JournalPosting] }
+
+    /// Import one or more QuickBooks Journal-report CSV exports as a single combined import.
+    /// QuickBooks caps a Journal export at a row limit, so a long history must be exported in
+    /// chunks (e.g. one file per quarter or year). Pass them all here and they import together
+    /// with a continuous transaction counter, so later chunks don't overwrite earlier ones.
+    /// Replaces any prior `qb_import`, so re-running with the full set is safe and idempotent.
+    @discardableResult
+    static func importJournalCSVFiles(_ texts: [String], into db: SQLiteDatabase) throws -> Summary {
         var summary = Summary()
 
         var accountIDByName: [String: Int64] = [:]
@@ -89,47 +100,51 @@ enum QuickBooksJournalImportService {
             return ""
         }
 
-        try db.deleteJournalEntries(kind: "qb_import")   // re-import replaces a prior import
-
-        struct Group { var date: String; var name: String; var lines: [SQLiteDatabase.JournalPosting] }
-        var groups: [String: Group] = [:]
-        var order: [String] = []
-        var lastTrans = "", lastDate = "", lastName = ""
-
-        for r in records {
-            var trans = value(r, ["trans_#", "trans", "trans_no", "transaction_#"])
-            if trans.isEmpty { trans = lastTrans } else { lastTrans = trans }
-            var date = value(r, ["date"]); if date.isEmpty { date = lastDate } else { lastDate = date }
-            let nm = value(r, ["name"]); if !nm.isEmpty { lastName = nm }
-            let account = value(r, ["account"]); if account.isEmpty { continue }
-            let debit = parseAmount(value(r, ["debit"]))
-            let credit = parseAmount(value(r, ["credit"]))
-            if abs(debit) < 0.005 && abs(credit) < 0.005 { continue }
-            if trans.isEmpty { trans = "row-\(order.count)" }
-            let acct = try accountID(for: account)
-            if groups[trans] == nil {
-                groups[trans] = Group(date: normalizeDate(date), name: lastName, lines: [])
-                order.append(trans)
-            }
-            groups[trans]?.lines.append(SQLiteDatabase.JournalPosting(accountID: acct, debit: debit, credit: credit))
-        }
+        try db.deleteJournalEntries(kind: "qb_import")   // re-import (the full set) replaces any prior import
 
         var counter: Int64 = 0
-        for key in order {
-            guard var group = groups[key] else { continue }
-            counter += 1
-            let residual = group.lines.reduce(0.0) { $0 + $1.debit - $1.credit }
-            if abs(residual) > 0.005 {
-                let obe = try openingBalanceEquityID()
-                group.lines.append(residual > 0
-                    ? SQLiteDatabase.JournalPosting(accountID: obe, debit: 0, credit: residual)
-                    : SQLiteDatabase.JournalPosting(accountID: obe, debit: -residual, credit: 0))
-                summary.balancingPlug += abs(residual)
+        for text in texts {
+            let records = CSVParser.parse(trimmedToHeader(text))
+            // Group rows into transactions within this chunk (QuickBooks restarts Trans # per
+            // export, so grouping is per-file; the posted txn id uses the continuous counter).
+            var groups: [String: Group] = [:]
+            var order: [String] = []
+            var lastTrans = "", lastDate = "", lastName = ""
+
+            for r in records {
+                var trans = value(r, ["trans_#", "trans", "trans_no", "transaction_#"])
+                if trans.isEmpty { trans = lastTrans } else { lastTrans = trans }
+                var date = value(r, ["date"]); if date.isEmpty { date = lastDate } else { lastDate = date }
+                let nm = value(r, ["name"]); if !nm.isEmpty { lastName = nm }
+                let account = value(r, ["account"]); if account.isEmpty { continue }
+                let debit = parseAmount(value(r, ["debit"]))
+                let credit = parseAmount(value(r, ["credit"]))
+                if abs(debit) < 0.005 && abs(credit) < 0.005 { continue }
+                if trans.isEmpty { trans = "row-\(order.count)" }
+                let acct = try accountID(for: account)
+                if groups[trans] == nil {
+                    groups[trans] = Group(date: normalizeDate(date), name: lastName, lines: [])
+                    order.append(trans)
+                }
+                groups[trans]?.lines.append(SQLiteDatabase.JournalPosting(accountID: acct, debit: debit, credit: credit))
             }
-            try db.postJournalEntry(kind: "qb_import", txnID: counter, date: group.date,
-                                    lines: group.lines, memo: group.name)
-            summary.transactions += 1
-            summary.lines += group.lines.count
+
+            for key in order {
+                guard var group = groups[key] else { continue }
+                counter += 1
+                let residual = group.lines.reduce(0.0) { $0 + $1.debit - $1.credit }
+                if abs(residual) > 0.005 {
+                    let obe = try openingBalanceEquityID()
+                    group.lines.append(residual > 0
+                        ? SQLiteDatabase.JournalPosting(accountID: obe, debit: 0, credit: residual)
+                        : SQLiteDatabase.JournalPosting(accountID: obe, debit: -residual, credit: 0))
+                    summary.balancingPlug += abs(residual)
+                }
+                try db.postJournalEntry(kind: "qb_import", txnID: counter, date: group.date,
+                                        lines: group.lines, memo: group.name)
+                summary.transactions += 1
+                summary.lines += group.lines.count
+            }
         }
         return summary
     }

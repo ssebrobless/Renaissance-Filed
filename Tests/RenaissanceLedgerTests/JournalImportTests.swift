@@ -80,4 +80,39 @@ struct JournalImportTests {
         let trimmed = QuickBooksJournalImportService.trimmedToHeader(Self.sampleJournal)
         #expect(trimmed.hasPrefix("\"Trans #\""))
     }
+
+    /// QuickBooks caps a Journal export, so a long history is exported in chunks. Two chunks —
+    /// each restarting Trans # at 1, the way QuickBooks numbers a fresh export.
+    static let chunkOne = """
+    "Trans #","Type","Date","Num","Name","Memo","Account","Debit","Credit"
+    "1","Invoice","01/15/2026","1001","Acme Co","","Accounts Receivable","1,000.00",""
+    "1","Invoice","01/15/2026","1001","Acme Co","","Consulting Income","","1,000.00"
+    """
+    static let chunkTwo = """
+    "Trans #","Type","Date","Num","Name","Memo","Account","Debit","Credit"
+    "1","Check","02/20/2026","5001","Staples","","Office Supplies","200.00",""
+    "1","Check","02/20/2026","5001","Staples","","Business Checking","","200.00"
+    """
+
+    @Test("Chunked Journal files import together, later chunks not overwriting earlier ones")
+    func chunkedImportKeepsAllChunks() throws {
+        let db = try seededDB()
+        let summary = try QuickBooksJournalImportService.importJournalCSVFiles([Self.chunkOne, Self.chunkTwo], into: db)
+
+        // Both transactions survive even though each chunk reuses Trans # 1.
+        #expect(summary.transactions == 2)
+        #expect(try db.ledgerBalance(named: "Accounts Receivable") == 1000)   // from chunk 1
+        #expect(try db.ledgerBalance(named: "Office Supplies") == 200)        // chunk 2 didn't wipe chunk 1
+        let totals = try db.trialBalanceTotals()
+        #expect(abs(totals.debits - totals.credits) < 0.005)
+    }
+
+    @Test("Re-importing the full chunk set replaces the prior import, not duplicates it")
+    func chunkedReimportReplaces() throws {
+        let db = try seededDB()
+        _ = try QuickBooksJournalImportService.importJournalCSVFiles([Self.chunkOne, Self.chunkTwo], into: db)
+        _ = try QuickBooksJournalImportService.importJournalCSVFiles([Self.chunkOne, Self.chunkTwo], into: db)
+        #expect(try db.ledgerBalance(named: "Accounts Receivable") == 1000)   // not 2000
+        #expect(try db.ledgerBalance(named: "Office Supplies") == 200)
+    }
 }
