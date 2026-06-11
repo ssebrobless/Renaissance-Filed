@@ -11,10 +11,13 @@ It was built and proven on one real business (a tile-installation contractor) be
 being open-sourced. The financial workflows it ships with are the ones that business
 actually used every day, reconciled to the bank to the penny.
 
-> **Status: real and working, but early.** This is honest open source, not a polished
-> product. It has been battle-tested on a single live business; it is **not yet a
-> turnkey install-and-go replacement for everyone.** See [Where it's at](#where-its-at)
-> and [Roadmap](#roadmap) before relying on it for your books.
+> **Status: the roadmap is delivered.** What began as "proven on one business, but
+> early" is now a complete double-entry bookkeeping app with its own tested ledger,
+> self-computed financial statements, a full QuickBooks migration path, and first-run
+> onboarding — all backed by an automated test suite. It has been validated on a real
+> live business (a tile contractor), including migrating that business's books onto it.
+> It's still deliberately small — see [The honest ceiling](#the-honest-ceiling) — and
+> still primarily proven on that one business, so review your numbers before relying on it.
 
 ---
 
@@ -38,8 +41,18 @@ people whose books are simple and who just want to keep doing what they were doi
 - **Job costing** — profitability per job (genuinely useful for contractors).
 - **1099 tracking** for subcontractors.
 - **Bank reconciliation** against a real statement.
-- **Reports** — operational cash summary, A/R & A/P aging, job profitability, payee
-  spend, customer statements.
+- **Double-entry ledger** — every operational action posts balanced debits and credits
+  to a real journal, and the books always balance by construction.
+- **Self-computed financial statements** — a true Profit & Loss and a Balance Sheet
+  derived from the ledger (the Balance Sheet balances by construction), alongside A/R &
+  A/P aging, job profitability, payee spend, and customer statements.
+- **QuickBooks migration** — import your chart of accounts, customers, and vendors (IIF)
+  and your full transaction history (Journal-report CSV, in as many chunks as QuickBooks
+  splits it into), then a one-click check that confirms an imported balance matches your
+  last QuickBooks statement to the penny. For books that won't reconstruct cleanly, a
+  **mid-year cutover** lets you start from opening balances and go forward.
+- **First-run onboarding** — a guided wizard: company info, a starter chart of accounts
+  (general / contractor / freelancer), and optional opening balances.
 - **Document archive** and a few quality-of-life helpers (mail triage, scanned
   order-sheet capture).
 - **Print / Save-PDF / email** for invoices, estimates, checks, and reports.
@@ -47,7 +60,7 @@ people whose books are simple and who just want to keep doing what they were doi
 ## What it deliberately does *not* do
 
 This is minimalist **on purpose**. It does **not** include payroll, automated sales tax,
-inventory, multi-currency, multi-user/cloud access, or a full audit-grade general ledger.
+inventory, multi-currency, or multi-user/cloud access.
 Those are exactly the features that make "big" accounting software complex and expensive —
 the things people at this end of the market are trying to get away from. If you need them,
 you've outgrown this tool (and that's fine — see [The honest ceiling](#the-honest-ceiling)).
@@ -56,18 +69,25 @@ you've outgrown this tool (and that's fine — see [The honest ceiling](#the-hon
 
 Honest about the internals, because it's your money:
 
-- **Accounting model:** it is *not* a full double-entry general ledger. Reports are
-  derived from the operational tables (invoices, expenses, deposits, payments) — a
-  cash-leaning, "QuickBooks-style" model. What it computes (cash P&L, A/R/A/P aging, job
-  profitability, bank reconciliation) has been verified correct to the penny on a real
-  business. It does **not yet compute its own formal Balance Sheet / Trial Balance** —
-  those, where shown, are imported snapshots.
-- **Migration:** the included import path was built around one specific QuickBooks
-  Desktop export. A **generalized importer** (standard QB IIF/CSV) is on the roadmap.
-- **Onboarding:** there is no create-a-company wizard yet. A new user can set company
-  info in Settings and start entering data, but the guided first-run flow is roadmap.
-- **Tests:** there is no unit-test suite yet. Verification today is done by the
-  `RenaissanceHarness` QA tool (see below).
+- **Accounting model:** a real **double-entry general ledger**. Every operational write
+  (invoice, payment, deposit, expense, bill, bill payment, sales receipt, customer
+  credit) posts balanced journal lines as it happens, and the same rules backfill a
+  whole-ledger rebuild — so live posting and a rebuild are identical by construction. The
+  app computes **its own Profit & Loss and Balance Sheet** from the ledger; the Balance
+  Sheet balances by construction (equity includes retained earnings). The operational
+  reports (A/R/A/P aging, job profitability, bank reconciliation) remain and have been
+  verified to the penny on a real business.
+- **Migration:** a generalized importer for standard QuickBooks Desktop exports — chart
+  of accounts / customers / vendors via **IIF**, transactions via the **Journal-report
+  CSV** (multiple chunked files supported), plus a reconciliation check. For books whose
+  migrated history won't reconstruct cleanly, a **mid-year cutover** records opening
+  balances so the statements are correct from a chosen date forward. All from Settings.
+- **Onboarding:** a first-run wizard — company info, a starter chart-of-accounts template,
+  and optional opening balances.
+- **Tests:** an automated suite (Swift Testing) covers the money-in/out flows, the
+  posting layer, the computed statements, the QuickBooks importers, onboarding, and the
+  cutover migration. The `RenaissanceHarness` QA tool (below) additionally drives the
+  live app end-to-end.
 
 ## The honest ceiling
 
@@ -97,23 +117,28 @@ default; see the script for using your own signing identity).
 `RenaissanceHarness` is a **developer tool, not an end-user feature.** It drives the app
 through macOS Accessibility and runs "prove" probes that seed a sandbox copy of the books
 and assert the money-in, money-out, job-costing, report, and bank-reconciliation math is
-correct to the penny. It's how the financial core was certified. End users never need it.
+correct to the penny. It complements the unit-test suite (`swift test`) by exercising the
+real, running app end-to-end. End users never need it.
 
 ## Roadmap
 
-The path from "proven on one business" to "anyone can use it" — full detail, including the
-decision to add a real **double-entry posting layer**, is in **[docs/ROADMAP.md](docs/ROADMAP.md)**.
+The path from "proven on one business" to "anyone can use it" is **delivered**. Full
+detail, including the architectural decisions behind the double-entry posting layer
+(ADR-001) and the mid-year cutover migration (ADR-002), is in
+**[docs/ROADMAP.md](docs/ROADMAP.md)**.
 
-In recommended order:
+- ✅ **Unit-test suite** — the safety net.
+- ✅ **Double-entry posting layer + self-computed P&L and Balance Sheet** — real,
+  always-balancing statements, derived from the ledger.
+- ✅ **Generalized QuickBooks import** — IIF lists + chunked Journal-report CSV + a
+  "your imported balance matches your last QuickBooks statement ✓" reconciliation check.
+- ✅ **Create-company / first-run onboarding.**
+- ✅ **Mid-year opening-balance cutover migration** — for books that can't be rebuilt
+  faithfully from imperfect history.
 
-1. **A unit-test suite** (the safety net — first).
-2. **Double-entry posting layer + self-computed P&L and Balance Sheet**, so a from-scratch
-   user gets real, always-balancing year-end statements.
-3. **Generalized QuickBooks import** (IIF lists + Journal-report CSV) + a "your imported
-   balance matches your last QuickBooks statement ✓" reconciliation check.
-4. **Create-company / first-run onboarding.**
-
-Contributions toward any of these are welcome — see the [issues tracker](../../issues).
+What's left is hardening rather than features: validating the Journal-CSV parser against
+more real-world QuickBooks exports, and the usual polish. Contributions welcome — see the
+[issues tracker](../../issues).
 
 ## License
 
